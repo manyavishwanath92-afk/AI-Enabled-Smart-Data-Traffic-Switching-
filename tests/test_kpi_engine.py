@@ -68,6 +68,47 @@ def test_compute_qoe_starved_state_on_zero_buffer():
     assert ue.qoe_state == QoEState.STARVED
 
 
+def test_playback_continuity_and_radio_kpis_are_recorded():
+    cfg = SimConfig.default()
+    engine = KPIEngine(cfg)
+    threshold = sinr_threshold_linear(cfg.sinr_threshold_db)
+    healthy = UE(ue_id="ok", x_km=0, y_km=0, buffer_seconds=5.0, sinr_linear=threshold * 4)
+    starved = UE(ue_id="dry", x_km=0, y_km=0, buffer_seconds=0.0, sinr_linear=threshold * 4)
+    result = DeliveryResult(
+        mode="unicast", segment_id="s0", cell_id="c0", n_requesting=2,
+        required_resource_mbps=4.0, congestion=0.2,
+        achievable_mbps_by_ue={"ok": 2.0, "dry": 0.5},
+        delivered_ue_ids=["ok", "dry"],
+    )
+    record = engine.record_tick(
+        tick=1, sim_time_s=1.0, ues=[healthy, starved], delivery_results=[result], dt=1.0
+    )
+
+    # One of two UEs stalled this tick.
+    assert record.playback_continuity == 0.5
+    assert record.rebuffering_events == 1
+    assert record.mean_achievable_mbps == 1.25
+    assert record.mean_sinr_db > 0
+
+
+def test_rebuffering_counts_one_event_per_outage_not_per_tick():
+    cfg = SimConfig.default()
+    engine = KPIEngine(cfg)
+    starved = UE(ue_id="dry", x_km=0, y_km=0, buffer_seconds=0.0)
+    result = DeliveryResult(
+        mode="unicast", segment_id="s0", cell_id="c0", n_requesting=1,
+        required_resource_mbps=2.0, congestion=0.1, delivered_ue_ids=["dry"],
+    )
+    for tick in range(1, 4):  # stalled for three consecutive ticks
+        record = engine.record_tick(
+            tick=tick, sim_time_s=float(tick), ues=[starved], delivery_results=[result], dt=1.0
+        )
+
+    assert starved.stall_ticks == 3
+    assert record.rebuffering_events == 1  # one outage, not three
+    assert record.playback_continuity == 0.0
+
+
 def test_export_csv_writes_header_and_row(tmp_path):
     cfg = SimConfig.default()
     engine = KPIEngine(cfg)

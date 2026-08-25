@@ -10,8 +10,10 @@ the unicast/broadcast tradeoff rather than hardcoding a winner.
 
 import math
 
+import pytest
+
 from config.config import SimConfig
-from traffic_sim.simulation.mode_selectors import always_broadcast, always_unicast
+from traffic_sim.simulation.mode_selectors import always_broadcast, always_unicast, rule_by_group_size
 from traffic_sim.simulation.simulator import Simulator
 
 
@@ -56,6 +58,67 @@ def test_flash_crowd_shows_a_much_larger_broadcast_advantage_than_a_sparse_scena
     sparse_summary = run_matched("uniform", always_broadcast, seed=999, num_ues=6)
 
     assert flash_summary["resource_savings_vs_baseline"] > sparse_summary["resource_savings_vs_baseline"]
+
+
+# --- Phase 2: radio conditions now drive delivery ---------------------------
+
+
+def test_service_continuity_is_no_longer_degenerate_zero():
+    """The concrete regression this phase fixes.
+
+    Under Phase 1's inherited interference constant, SINR collapsed so far
+    that the 5 dB threshold was never met and service_continuity read
+    0.0000 in every run. With the calibrated noise-rise model it must be a
+    real, non-zero measurement.
+    """
+    summary = run_matched("flash_crowd", always_broadcast)
+    assert summary["service_continuity"] > 0.0
+    assert summary["mean_sinr_db"] > 5.0
+
+
+def test_legacy_interference_model_reproduces_the_phase1_degeneracy():
+    """The old model is preserved as a documented baseline, not deleted."""
+    cfg = SimConfig.default().with_overrides(
+        interference_model="legacy_linear_mw", random_seed=123, num_ues=100
+    )
+    sim = Simulator(cfg, always_broadcast, scenario="flash_crowd")
+    sim.run(duration_s=30)
+    summary = sim.kpi_engine.summary()
+
+    assert summary["service_continuity"] == pytest.approx(0.0)
+    assert summary["mean_achievable_mbps"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_flash_crowd_unicast_starves_while_broadcast_sustains_playback():
+    """Radio-driven, not accounting-driven: under a flash crowd the unicast
+    UEs share the cell's capacity and starve, while the single shared
+    broadcast transmission keeps every listener playing."""
+    unicast_summary = run_matched("flash_crowd", always_unicast)
+    broadcast_summary = run_matched("flash_crowd", always_broadcast)
+
+    assert broadcast_summary["mean_achievable_mbps"] > unicast_summary["mean_achievable_mbps"]
+    assert broadcast_summary["playback_continuity"] > unicast_summary["playback_continuity"]
+    assert broadcast_summary["buffer_starvation_rate"] < unicast_summary["buffer_starvation_rate"]
+    assert broadcast_summary["total_rebuffering_events"] < unicast_summary["total_rebuffering_events"]
+
+
+def test_broadcast_offload_relieves_the_remaining_unicast_users():
+    """Two-pass step(): UEs moved to broadcast stop consuming cellular
+    share, so the UEs still on unicast get more throughput each. Compared
+    at equal cell population, with only the offload differing."""
+    cfg = SimConfig.default().with_overrides(random_seed=5, num_ues=120, num_cells=1)
+
+    all_unicast = Simulator(cfg, always_unicast, scenario="flash_crowd")
+    all_unicast.run(duration_s=30)
+
+    # rule-by-group-size offloads the big flash-crowd group to broadcast,
+    # leaving the small groups on unicast with the cell largely to themselves.
+    mixed = Simulator(cfg, rule_by_group_size(threshold=20), scenario="flash_crowd")
+    mixed.run(duration_s=30)
+
+    assert mixed.kpi_engine.summary()["mean_achievable_mbps"] > all_unicast.kpi_engine.summary()[
+        "mean_achievable_mbps"
+    ]
 
 
 def test_simulation_runs_long_without_nan_or_exceptions():

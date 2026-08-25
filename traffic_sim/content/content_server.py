@@ -25,15 +25,24 @@ class ContentServer:
         self._generate_segments()
 
     def _generate_segments(self) -> None:
-        for i in range(self._config.num_segments):
+        cfg = self._config
+        for i in range(cfg.num_segments):
             segment_id = f"seg_{i}"
-            size_mb = self._rng.uniform(1.0, 8.0)
+            # Draw duration and bitrate independently, then DERIVE size so
+            # the three stay mutually consistent (size = bitrate*duration/8).
+            # Drawing size and duration independently — as this did before
+            # Phase 2 — left each segment with an accidental implied bitrate
+            # spanning ~0.6-10 Mbps, which made buffer fill rates a function
+            # of random draws rather than of modeled network conditions.
             duration_sec = self._rng.uniform(5.0, 30.0)
+            bitrate_mbps = self._rng.uniform(cfg.segment_bitrate_mbps_min, cfg.segment_bitrate_mbps_max)
+            size_mb = (bitrate_mbps * duration_sec) / 8.0
             priority = self._rng.choice([0, 0, 1, 2])  # skewed toward delay-tolerant
             self._segments[segment_id] = Segment(
                 segment_id=segment_id,
                 size_mb=size_mb,
                 duration_sec=duration_sec,
+                bitrate_mbps=bitrate_mbps,
                 popularity=0.0,
                 service_priority=priority,
             )

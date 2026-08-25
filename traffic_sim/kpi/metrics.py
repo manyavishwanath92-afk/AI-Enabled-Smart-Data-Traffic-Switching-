@@ -17,8 +17,14 @@ from config.config import SimConfig
 from traffic_sim.delivery.result import DeliveryResult
 from traffic_sim.kpi.bandwidth import resource_savings, spectrum_efficiency
 from traffic_sim.kpi.qoe import compute_qoe
-from traffic_sim.kpi.reliability import buffer_starvation_rate, service_continuity, successful_delivery_ratio
-from traffic_sim.network.sinr import sinr_threshold_linear
+from traffic_sim.kpi.reliability import (
+    buffer_starvation_rate,
+    observe_playback,
+    playback_continuity,
+    service_continuity,
+    successful_delivery_ratio,
+)
+from traffic_sim.network.sinr import sinr_threshold_linear, sinr_to_db
 from traffic_sim.simulation.buffer import group_safety_buffer
 from traffic_sim.simulation.user import UE
 
@@ -37,7 +43,15 @@ class KPIRecord:
     mean_buffer_seconds: float
     min_group_buffer_seconds: float
     buffer_starvation_rate: float
+    # SINR-threshold half of the guide's service-continuity KPI (Sec. 11).
     service_continuity: float
+    # Actual-playback half of the same KPI: fraction of UE-ticks not stalled.
+    playback_continuity: float
+    rebuffering_events: int
+    # Phase 2 radio-chain visibility: what SINR the UEs actually saw and
+    # what delivery rate that translated into after resource sharing.
+    mean_sinr_db: float
+    mean_achievable_mbps: float
     successful_delivery_ratio: float
     mean_spectrum_efficiency: float
     mean_qoe: float
@@ -86,6 +100,21 @@ class KPIEngine:
 
         sinr_observations = [ue.sinr_linear for ue in ues if ue.sinr_linear is not None]
         continuity = service_continuity(sinr_observations, self._threshold_linear)
+        mean_sinr_db = (
+            statistics.mean(sinr_to_db(s) for s in sinr_observations if s > 0)
+            if any(s > 0 for s in sinr_observations)
+            else 0.0
+        )
+
+        # Advance playback counters once per tick, then report continuity.
+        observe_playback(ues)
+        playback = playback_continuity(ues)
+        total_rebuffering = sum(ue.rebuffering_events for ue in ues)
+
+        achievable_values = [
+            v for r in delivery_results for v in r.achievable_mbps_by_ue.values()
+        ]
+        mean_achievable = statistics.mean(achievable_values) if achievable_values else 0.0
 
         se_values = []
         for r in delivery_results:
@@ -110,6 +139,10 @@ class KPIEngine:
             min_group_buffer_seconds=min_group_buffer,
             buffer_starvation_rate=starvation,
             service_continuity=continuity,
+            playback_continuity=playback,
+            rebuffering_events=total_rebuffering,
+            mean_sinr_db=mean_sinr_db,
+            mean_achievable_mbps=mean_achievable,
             successful_delivery_ratio=successful_ratio,
             mean_spectrum_efficiency=mean_se,
             mean_qoe=mean_qoe,
@@ -142,6 +175,9 @@ class KPIEngine:
             "min_group_buffer_seconds",
             "buffer_starvation_rate",
             "service_continuity",
+            "playback_continuity",
+            "mean_sinr_db",
+            "mean_achievable_mbps",
             "successful_delivery_ratio",
             "mean_spectrum_efficiency",
             "mean_qoe",
@@ -153,6 +189,9 @@ class KPIEngine:
         result["total_required_resource_mbps"] = sum(r.total_required_resource_mbps for r in self._records)
         result["total_resource_baseline_always_unicast_mbps"] = sum(
             r.resource_baseline_always_unicast_mbps for r in self._records
+        )
+        result["total_rebuffering_events"] = (
+            self._records[-1].rebuffering_events if self._records else 0
         )
         result["num_ticks"] = len(self._records)
         return result

@@ -77,17 +77,33 @@ class Simulator:
                 continue
             groups.setdefault((ue.cell_id, ue.requested_segment), []).append(ue)
 
-        delivery_results: list[DeliveryResult] = []
+        # Pass 1 — decide every group's delivery mode BEFORE delivering any
+        # of them, so we can count how many UEs each cell is actually
+        # serving by unicast. UEs offloaded to broadcast must not count
+        # against the cellular resource share of the UEs that remain on
+        # unicast; that offload relief is a core claim of the project and
+        # only becomes measurable if modes are known up front.
+        decisions: list[tuple[str, str, list[UE], DeliveryMode]] = []
+        unicast_users_by_cell: dict[str, int] = {c.cell_id: 0 for c in self.cells}
         for (cell_id, segment_id), group_ues in groups.items():
+            cell = cells_by_id[cell_id]
+            mode = self.mode_selector(segment_id, group_ues, cell, cfg)
+            decisions.append((cell_id, segment_id, group_ues, mode))
+            if mode != DeliveryMode.BROADCAST:
+                unicast_users_by_cell[cell_id] += len(group_ues)
+
+        # Pass 2 — deliver, with the correct per-cell unicast sharing count.
+        delivery_results: list[DeliveryResult] = []
+        for cell_id, segment_id, group_ues, mode in decisions:
             cell = cells_by_id[cell_id]
             segment = self.content_server.get_segment(segment_id)
             active_users_in_cell = len(cell.connected_ue_ids)
+            unicast_users_in_cell = unicast_users_by_cell[cell_id]
 
-            mode = self.mode_selector(segment_id, group_ues, cell, cfg)
-            if mode == DeliveryMode.BROADCAST:
-                result = self._broadcast.deliver(group_ues, segment, cell, cfg, dt, active_users_in_cell)
-            else:
-                result = self._unicast.deliver(group_ues, segment, cell, cfg, dt, active_users_in_cell)
+            deliverer = self._broadcast if mode == DeliveryMode.BROADCAST else self._unicast
+            result = deliverer.deliver(
+                group_ues, segment, cell, cfg, dt, active_users_in_cell, unicast_users_in_cell
+            )
 
             cell.add_load(result.required_resource_mbps)
             delivery_results.append(result)

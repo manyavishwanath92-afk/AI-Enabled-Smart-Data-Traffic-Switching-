@@ -23,3 +23,34 @@ def buffer_starvation_rate(ues: list[UE]) -> float:
         return 0.0
     starved = sum(1 for ue in ues if ue.buffer_seconds <= 0.0)
     return starved / len(ues)
+
+
+def observe_playback(ues: list[UE]) -> None:
+    """Advance each UE's playback-continuity counters for this tick.
+
+    A UE is stalled on a tick when its buffer is empty. A rebuffering
+    event is counted only on the transition from playing to stalled, so a
+    long outage is one event rather than one per tick.
+    """
+    for ue in ues:
+        ue.playback_ticks += 1
+        stalled_now = ue.buffer_seconds <= 0.0
+        if stalled_now:
+            ue.stall_ticks += 1
+            if not ue.is_stalled:
+                ue.rebuffering_events += 1
+        ue.is_stalled = stalled_now
+
+
+def playback_continuity(ues: list[UE]) -> float:
+    """Fraction of observed UE-ticks spent actually playing rather than stalled.
+
+    This is the "actual playback/delivery continuity" half of the guide's
+    service-continuity KPI (Section 11); `service_continuity` above is the
+    SINR-threshold half. Both are reported.
+    """
+    total_ticks = sum(ue.playback_ticks for ue in ues)
+    if total_ticks <= 0:
+        return 1.0
+    stalled = sum(ue.stall_ticks for ue in ues)
+    return 1.0 - (stalled / total_ticks)

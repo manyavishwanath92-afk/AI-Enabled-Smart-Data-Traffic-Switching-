@@ -46,3 +46,10 @@ class UE:
     direction_rad: float = 0.0
     sinr_linear: float | None = None
     mobility_risk: float | None = None
+    # Playback continuity accounting (Guide Section 11): a UE stalls on a
+    # tick when its buffer is empty, and a rebuffering event is counted on
+    # the transition from playing to stalled (not once per stalled tick).
+    stall_ticks: int = 0
+    playback_ticks: int = 0
+    rebuffering_events: int = 0
+    is_stalled: bool = False

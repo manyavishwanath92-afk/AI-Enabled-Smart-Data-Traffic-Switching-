@@ -99,6 +99,90 @@ def test_unicast_congestion_exceeds_broadcast_when_cell_capacity_limited():
     assert unicast_result.congestion == 1.0  # clamped, 150 >> 50
 
 
+def test_cell_edge_ue_receives_less_content_than_cell_centre_ue():
+    """Phase 2's core guarantee: radio conditions now gate delivery.
+
+    Two UEs, identical in every way except distance from the cell centre,
+    delivered in the same call with the same resources. The edge UE has
+    worse SINR, hence lower Shannon capacity, hence a lower achievable
+    rate, hence less content received. In Phase 1 these were identical
+    because throughput was resource-only.
+    """
+    cfg = SimConfig.default()  # noise_rise model by default
+    cell = Cell(cell_id="c0", center_x_km=0, center_y_km=0, maximum_capacity_mbps=1000.0, broadcast_capacity_mbps=600.0)
+    segment = Segment(segment_id="s0", size_mb=5.0, duration_sec=10.0)
+
+    centre_ue = UE(ue_id="centre", x_km=0.01, y_km=0.0, cell_id="c0")
+    edge_ue = UE(ue_id="edge", x_km=3.0, y_km=0.0, cell_id="c0")
+
+    result = UnicastDelivery().deliver(
+        [centre_ue, edge_ue], segment, cell, cfg, dt=1.0, active_users_in_cell=80, unicast_users_in_cell=80
+    )
+
+    assert result.sinr_by_ue["centre"] > result.sinr_by_ue["edge"]
+    assert result.achievable_mbps_by_ue["centre"] > result.achievable_mbps_by_ue["edge"]
+    assert (
+        result.content_received_seconds_by_ue["centre"] > result.content_received_seconds_by_ue["edge"]
+    )
+
+
+def test_unicast_content_received_falls_as_cell_unicast_load_rises():
+    """More UEs sharing the cell -> less content each, via the radio share."""
+    cfg = SimConfig.default()
+    cell = Cell(cell_id="c0", center_x_km=0, center_y_km=0, maximum_capacity_mbps=1000.0, broadcast_capacity_mbps=600.0)
+    segment = Segment(segment_id="s0", size_mb=5.0, duration_sec=10.0)
+
+    def received_with_load(load: int) -> float:
+        ue = make_group(1, cell)[0]
+        result = UnicastDelivery().deliver(
+            [ue], segment, cell, cfg, dt=1.0, active_users_in_cell=load, unicast_users_in_cell=load
+        )
+        return result.content_received_seconds_by_ue[ue.ue_id]
+
+    # Below ~100 UEs the per-UE radio share still exceeds the segment's
+    # 4 Mbps bitrate, so the cap binds and content received is flat at
+    # real-time; above it, the radio share is what binds and delivery falls.
+    assert received_with_load(5) == pytest.approx(received_with_load(50))
+    assert received_with_load(400) < received_with_load(200) < received_with_load(100)
+
+
+def test_broadcast_content_received_is_identical_for_every_group_member():
+    """One shared transmission -> everyone gets the same seconds of content."""
+    cfg = SimConfig.default()
+    cell = Cell(cell_id="c0", center_x_km=0, center_y_km=0, maximum_capacity_mbps=1000.0, broadcast_capacity_mbps=600.0)
+    segment = Segment(segment_id="s0", size_mb=5.0, duration_sec=10.0)
+    group = make_group(20, cell)
+
+    result = BroadcastDelivery().deliver(group, segment, cell, cfg, dt=1.0, active_users_in_cell=20)
+
+    values = set(result.content_received_seconds_by_ue.values())
+    assert len(values) == 1
+
+
+def test_broadcast_beats_unicast_on_content_delivered_under_heavy_load():
+    """The physical mechanism behind the whole project, at delivery level."""
+    cfg = SimConfig.default()
+    segment = Segment(segment_id="s0", size_mb=5.0, duration_sec=10.0)
+
+    def fresh_cell():
+        return Cell(
+            cell_id="c0", center_x_km=0, center_y_km=0,
+            maximum_capacity_mbps=1000.0, broadcast_capacity_mbps=600.0,
+        )
+
+    cell_u, cell_b = fresh_cell(), fresh_cell()
+    group_u, group_b = make_group(80, cell_u), make_group(80, cell_b)
+
+    u = UnicastDelivery().deliver(
+        group_u, segment, cell_u, cfg, dt=1.0, active_users_in_cell=80, unicast_users_in_cell=80
+    )
+    b = BroadcastDelivery().deliver(group_b, segment, cell_b, cfg, dt=1.0, active_users_in_cell=80)
+
+    mean_u = sum(u.content_received_seconds_by_ue.values()) / len(group_u)
+    mean_b = sum(b.content_received_seconds_by_ue.values()) / len(group_b)
+    assert mean_b > mean_u
+
+
 def test_delivery_updates_ue_buffers_and_delivery_mode():
     cfg = SimConfig.default()
     cell = Cell(cell_id="c0", center_x_km=0, center_y_km=0, maximum_capacity_mbps=1000.0, broadcast_capacity_mbps=600.0)
