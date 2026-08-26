@@ -41,6 +41,7 @@ class BroadcastDelivery:
         dt: float,
         active_users_in_cell: int,
         unicast_users_in_cell: int | None = None,
+        broadcast_groups_in_cell: int = 1,
     ) -> DeliveryResult:
         n_requesting = len(ues)
         required = required_resource_broadcast(config.segment_resource_mbps)
@@ -73,6 +74,7 @@ class BroadcastDelivery:
             shannon_mbps_at_worst_sinr=worst_shannon_mbps,
             broadcast_capacity_mbps=broadcast_capacity,
             segment_bitrate_mbps=segment.bitrate_mbps,
+            broadcast_groups_in_cell=broadcast_groups_in_cell,
         )
         received_seconds = delivered_seconds_of_content(achievable_mbps, segment.bitrate_mbps, dt)
         consumed_seconds = config.playback_consumption_rate * dt

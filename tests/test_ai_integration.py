@@ -1,0 +1,145 @@
+"""The AI layer running inside the real simulator, end to end."""
+
+import pytest
+
+from config.config import SimConfig
+from traffic_sim.ai.dataset import LABEL_NAMES, generate_dataset
+from traffic_sim.ai.feature_engineering import FEATURE_NAMES
+from traffic_sim.experiments.compare import run_comparison
+from traffic_sim.main import build_simulator
+
+
+def run_ai(scenario="flash_crowd", ticks=30, seed=11, **overrides):
+    cfg = SimConfig.default().with_overrides(random_seed=seed, **overrides)
+    simulator = build_simulator(cfg, "ai", scenario)
+    simulator.run(duration_s=ticks * cfg.simulation_timestep_s)
+    return simulator
+
+
+def mode_share(simulator) -> dict[str, float]:
+    counts: dict[str, int] = {}
+    for record in simulator.kpi_engine.to_records():
+        for part in record["mode_breakdown"].split(","):
+            if "=" in part:
+                mode, value = part.split("=")
+                counts[mode] = counts.get(mode, 0) + int(value)
+    total = sum(counts.values()) or 1
+    return {mode: count / total for mode, count in counts.items()}
+
+
+def test_ai_selector_runs_inside_the_simulator():
+    simulator = run_ai()
+    summary = simulator.kpi_engine.summary()
+
+    assert summary["num_ticks"] == 30
+    assert summary["service_continuity"] > 0.0
+
+
+def test_ai_agent_is_wired_to_the_content_catalogue():
+    simulator = run_ai()
+    assert simulator.mode_selector._content_server is simulator.content_server
+
+
+def test_switch_count_and_inference_latency_are_no_longer_placeholders():
+    simulator = run_ai()
+    records = simulator.kpi_engine.to_records()
+
+    assert all(r["switch_count"] is not None for r in records)
+    assert all(r["ai_inference_latency_ms"] is not None for r in records)
+    assert simulator.kpi_engine.summary()["mean_inference_latency_ms"] > 0.0
+
+
+def test_ai_meets_the_decision_latency_requirement():
+    """Inference must fit comfortably inside one segment interval."""
+    simulator = run_ai()
+    latency_ms = simulator.kpi_engine.summary()["mean_inference_latency_ms"]
+    assert latency_ms < 1000.0 * simulator.config.simulation_timestep_s
+
+
+def test_ai_offloads_a_flash_crowd_to_broadcast_when_the_carrier_is_free():
+    simulator = run_ai(broadcast_cell_capacity_mbps=60.0)
+    assert mode_share(simulator).get("broadcast", 0.0) > 0.5
+
+
+def test_ai_backs_off_broadcast_when_the_carrier_is_starved():
+    """The decision must depend on conditions, not be a constant.
+
+    This is the difference between an agent and a hardcoded rule: the
+    same code, the same traffic, a smaller broadcast carrier, and a
+    materially different policy comes out.
+    """
+    free = mode_share(run_ai(broadcast_cell_capacity_mbps=60.0)).get("broadcast", 0.0)
+    starved = mode_share(run_ai(broadcast_cell_capacity_mbps=4.0)).get("broadcast", 0.0)
+
+    assert starved < free - 0.2
+
+
+def test_ai_protects_continuity_relative_to_blind_broadcasting():
+    """With a starved carrier, always-broadcast wrecks playback. The AI
+    declining to broadcast everything must measurably beat it."""
+    cfg = SimConfig.default().with_overrides(broadcast_cell_capacity_mbps=4.0)
+    rows = {row.policy: row.summary for row in run_comparison(cfg, ticks=30, seeds=(11, 22))}
+
+    assert rows["ai"]["service_continuity"] > rows["always-broadcast"]["service_continuity"]
+    assert rows["ai"]["mean_qoe"] > rows["always-broadcast"]["mean_qoe"]
+
+
+def test_ai_saves_resources_relative_to_always_unicast_when_broadcast_is_viable():
+    cfg = SimConfig.default().with_overrides(broadcast_cell_capacity_mbps=60.0)
+    rows = {row.policy: row.summary for row in run_comparison(cfg, ticks=30, seeds=(11, 22))}
+
+    assert rows["ai"]["resource_savings_vs_baseline"] > 0.5
+    assert rows["ai"]["service_continuity"] >= rows["always-unicast"]["service_continuity"]
+
+
+# --- dataset and model round trip -------------------------------------------
+
+
+def test_dataset_has_the_expected_columns_and_sane_labels():
+    dataset = generate_dataset(seeds=(1,), scenarios=("flash_crowd",), ticks=3)
+
+    assert len(dataset) > 0
+    for row in dataset.rows:
+        assert set(row) == set(FEATURE_NAMES) | set(LABEL_NAMES)
+        assert row["y_unicast_mbps"] >= 0.0
+        assert row["y_broadcast_mbps"] >= 0.0
+
+
+def test_trained_model_round_trips_and_beats_a_naive_guess(tmp_path):
+    """Train small, save, reload, and check it actually learned something."""
+    pytest.importorskip("xgboost")
+    pytest.importorskip("sklearn")
+
+    from traffic_sim.ai.predict import OutcomePredictor
+    from traffic_sim.ai.train import train_models
+
+    dataset = generate_dataset(seeds=(1, 2), scenarios=("flash_crowd", "uniform"), ticks=6)
+    report = train_models(dataset, tmp_path)
+
+    for mode in ("unicast", "broadcast"):
+        assert report["modes"][mode]["r2"] > 0.5, f"{mode} model did not learn"
+
+    # The saved artifacts must load back into a working predictor.
+    cfg = SimConfig.default()
+    predictor = OutcomePredictor(cfg, model_dir=tmp_path)
+    assert predictor.uses_model is True
+
+
+def test_predictor_reports_which_path_it_used(tmp_path):
+    """Analytical results must never be silently labelled as model output."""
+    from traffic_sim.ai.predict import OutcomePredictor
+    from traffic_sim.ai.feature_engineering import extract_features
+    from traffic_sim.simulation.cell import Cell
+    from traffic_sim.content.segment import Segment
+    from traffic_sim.simulation.user import UE
+
+    cfg = SimConfig.default()
+    predictor = OutcomePredictor(cfg, model_dir=tmp_path / "empty")
+    assert predictor.uses_model is False
+
+    cell = Cell(cell_id="c0", center_x_km=0, center_y_km=0, maximum_capacity_mbps=100.0)
+    ue = UE(ue_id="u", x_km=0.1, y_km=0.0, cell_id="c0", buffer_seconds=5.0)
+    segment = Segment(segment_id="s0", size_mb=2.5, duration_sec=10.0, bitrate_mbps=2.0)
+    features = extract_features(segment, [ue], cell, cfg)
+
+    assert predictor.predict(features).source == "analytical"

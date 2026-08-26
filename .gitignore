@@ -9,6 +9,6 @@ data/generated/*.json
 !data/generated/.gitkeep
 data/training/*
 !data/training/.gitkeep
-models/*
-!models/.gitkeep
+# Trained XGBoost models ARE committed so `--mode-selector ai` works with
+# no setup step; retrain and re-commit whenever the simulator physics change.
 .DS_Store

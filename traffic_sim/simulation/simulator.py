@@ -1,11 +1,15 @@
 """Simulator: the per-tick orchestration loop (Guide Section 28).
 
 Delivery-mode selection is injected via a `mode_selector` callable rather
-than decided internally. In Phase 1 this is always a fixed, non-AI rule
-(always-unicast, always-broadcast, random, or a naive group-size
-threshold — see traffic_sim.main). This keeps a clean seam: Phase 2's AI
-agent will later be plugged in as just another `mode_selector`
-implementation, with no change required to Simulator itself.
+than decided internally, so the simulator never needs to know whether it
+is being driven by a fixed rule or by the AI agent — see
+traffic_sim.simulation.mode_selectors.
+
+Selectors may optionally expose two extra hooks, which the AI agent uses
+and plain functions simply do not have:
+
+  current_tick_stats()  -> decision telemetry for the KPI engine
+  observe(cells, results, record) -> closed-loop feedback after delivery
 """
 
 from __future__ import annotations
@@ -85,11 +89,15 @@ class Simulator:
         # only becomes measurable if modes are known up front.
         decisions: list[tuple[str, str, list[UE], DeliveryMode]] = []
         unicast_users_by_cell: dict[str, int] = {c.cell_id: 0 for c in self.cells}
+        broadcast_groups_by_cell: dict[str, int] = {c.cell_id: 0 for c in self.cells}
         for (cell_id, segment_id), group_ues in groups.items():
             cell = cells_by_id[cell_id]
             mode = self.mode_selector(segment_id, group_ues, cell, cfg)
             decisions.append((cell_id, segment_id, group_ues, mode))
-            if mode != DeliveryMode.BROADCAST:
+            if mode == DeliveryMode.BROADCAST:
+                # Concurrent broadcast streams share one carrier.
+                broadcast_groups_by_cell[cell_id] += 1
+            else:
                 unicast_users_by_cell[cell_id] += len(group_ues)
 
         # Pass 2 — deliver, with the correct per-cell unicast sharing count.
@@ -102,7 +110,14 @@ class Simulator:
 
             deliverer = self._broadcast if mode == DeliveryMode.BROADCAST else self._unicast
             result = deliverer.deliver(
-                group_ues, segment, cell, cfg, dt, active_users_in_cell, unicast_users_in_cell
+                group_ues,
+                segment,
+                cell,
+                cfg,
+                dt,
+                active_users_in_cell,
+                unicast_users_in_cell,
+                broadcast_groups_by_cell[cell_id],
             )
 
             cell.add_load(result.required_resource_mbps)
@@ -110,7 +125,23 @@ class Simulator:
 
         self._tick += 1
         self._sim_time_s += dt
-        return self.kpi_engine.record_tick(self._tick, self._sim_time_s, self.ues, delivery_results, dt)
+
+        # Decision telemetry, if the selector produces any. Plain-function
+        # selectors do not, and simply report nothing.
+        stats_fn = getattr(self.mode_selector, "current_tick_stats", None)
+        stats = stats_fn() if callable(stats_fn) else None
+        record = self.kpi_engine.record_tick(
+            self._tick, self._sim_time_s, self.ues, delivery_results, dt, decision_stats=stats
+        )
+
+        # Closed-loop feedback: the action has changed the network, so let
+        # the selector see the result before it decides again. Optional by
+        # design — only the AI agent implements `observe`.
+        observe = getattr(self.mode_selector, "observe", None)
+        if callable(observe):
+            observe(self.cells, delivery_results, record)
+
+        return record
 
     def run(self, duration_s: float | None = None) -> KPIEngine:
         duration_s = duration_s if duration_s is not None else self.config.simulation_duration_s

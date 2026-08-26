@@ -25,11 +25,13 @@ def test_transition_and_buffer_fields_configurable():
     assert cfg2.initial_buffer_seconds == 10.0
 
 
-def test_reserved_phase2_fields_present_but_inert():
+def test_ai_decision_fields_have_usable_defaults():
     cfg = SimConfig.default()
-    assert cfg.hysteresis_margin is None
-    assert cfg.cooldown_period_s is None
-    assert cfg.ai_model_path is None
+    assert cfg.hysteresis_margin > 0
+    assert cfg.cooldown_period_s > 0
+    assert 0.0 <= cfg.min_decision_confidence <= 1.0
+    assert cfg.ai_model_path
+    # None means "use ai.utility.DEFAULT_WEIGHTS".
     assert cfg.utility_weights is None
 
 

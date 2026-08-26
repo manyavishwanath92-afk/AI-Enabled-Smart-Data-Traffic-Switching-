@@ -32,10 +32,9 @@ distance or load and left the delivery chain unable to move any content
 at all. It has been removed rather than kept selectable — this simulator
 implements one interference model, and it is this one.
 
-There is deliberately no SINR threshold parameter: SINR affects service
-quality only through the delivery chain (Shannon capacity -> achievable
-rate -> buffer -> playback stalls), and service continuity is measured
-from actual stalls rather than from a radio cut-off.
+SINR affects service quality only through the delivery chain (Shannon
+capacity -> achievable rate -> buffer -> playback stalls). Service
+continuity is measured from actual stalls; see kpi.reliability.
 
 Still a simplified PoC model — not a physical multi-cell interference
 calculation.
@@ -114,11 +113,20 @@ class SimConfig:
     # --- Reproducibility ---
     random_seed: int = 42
 
-    # --- Reserved for later phases — present now so the schema does not
-    #     change shape in Phase 2, but read by ZERO Phase 1 code. ---
-    hysteresis_margin: float | None = None
-    cooldown_period_s: float | None = None
-    ai_model_path: str | None = None
+    # --- AI decision layer (traffic_sim.ai) ---
+    # A switch must improve utility by more than this to be worth making;
+    # stops the agent flip-flopping on near-ties.
+    hysteresis_margin: float = 0.05
+    # After switching a group's mode, hold it for this long before
+    # switching again.
+    cooldown_period_s: float = 5.0
+    # Below this confidence the agent keeps the current mode and logs that
+    # it declined to act.
+    min_decision_confidence: float = 0.15
+    # Directory holding the trained XGBoost outcome models. If the files
+    # are missing the agent falls back to computing outcomes analytically.
+    ai_model_path: str = "models"
+    # Utility weights (see traffic_sim.ai.utility). None -> DEFAULT_WEIGHTS.
     utility_weights: dict[str, float] | None = None
 
     def validate(self) -> None:
@@ -137,6 +145,12 @@ class SimConfig:
             raise ValueError("segment_resource_mbps must be > 0")
         if self.interference_rise_coeff < 0:
             raise ValueError("interference_rise_coeff must be >= 0")
+        if self.hysteresis_margin < 0:
+            raise ValueError("hysteresis_margin must be >= 0")
+        if self.cooldown_period_s < 0:
+            raise ValueError("cooldown_period_s must be >= 0")
+        if not 0.0 <= self.min_decision_confidence <= 1.0:
+            raise ValueError("min_decision_confidence must be in [0, 1]")
         if self.segment_bitrate_mbps_min <= 0:
             raise ValueError("segment_bitrate_mbps_min must be > 0")
         if self.segment_bitrate_mbps_max < self.segment_bitrate_mbps_min:

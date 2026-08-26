@@ -43,8 +43,7 @@ class KPIRecord:
     min_group_buffer_seconds: float
     buffer_starvation_rate: float
     # SC = 1 - (playback interruption time / total playback time). The
-    # single definition of service continuity — measured from actual
-    # stalls, not from any SINR threshold.
+    # single definition of service continuity, measured from actual stalls.
     service_continuity: float
     rebuffering_events: int
     # Phase 2 radio-chain visibility: what SINR the UEs actually saw and
@@ -54,8 +53,10 @@ class KPIRecord:
     successful_delivery_ratio: float
     mean_spectrum_efficiency: float
     mean_qoe: float
-    switch_count: int | None = None  # Phase 2 placeholder
-    ai_inference_latency_ms: float | None = None  # Phase 2 placeholder
+    # Populated when the delivery-mode selector reports decision telemetry
+    # (the AI agent does; fixed-rule selectors leave these as None).
+    switch_count: int | None = None
+    ai_inference_latency_ms: float | None = None
 
 
 class KPIEngine:
@@ -70,6 +71,7 @@ class KPIEngine:
         ues: list[UE],
         delivery_results: list[DeliveryResult],
         dt: float,
+        decision_stats: object | None = None,
     ) -> KPIRecord:
         cfg = self._config
 
@@ -97,7 +99,7 @@ class KPIEngine:
         starvation = buffer_starvation_rate(ues)
 
         # Radio quality, reported on its own — it influences service
-        # continuity only through the delivery chain, never as a threshold.
+        # continuity only through the delivery chain.
         sinr_observations = [ue.sinr_linear for ue in ues if ue.sinr_linear is not None]
         mean_sinr_db = (
             statistics.mean(sinr_to_db(s) for s in sinr_observations if s > 0)
@@ -144,6 +146,8 @@ class KPIEngine:
             successful_delivery_ratio=successful_ratio,
             mean_spectrum_efficiency=mean_se,
             mean_qoe=mean_qoe,
+            switch_count=getattr(decision_stats, "switch_count", None),
+            ai_inference_latency_ms=getattr(decision_stats, "mean_inference_latency_ms", None),
         )
         self._records.append(record)
         return record
@@ -189,6 +193,14 @@ class KPIEngine:
         )
         result["total_rebuffering_events"] = (
             self._records[-1].rebuffering_events if self._records else 0
+        )
+        switches = [r.switch_count for r in self._records if r.switch_count is not None]
+        latencies = [
+            r.ai_inference_latency_ms for r in self._records if r.ai_inference_latency_ms is not None
+        ]
+        result["total_switches"] = sum(switches) if switches else 0
+        result["mean_inference_latency_ms"] = (
+            statistics.mean(latencies) if latencies else 0.0
         )
         result["num_ticks"] = len(self._records)
         return result

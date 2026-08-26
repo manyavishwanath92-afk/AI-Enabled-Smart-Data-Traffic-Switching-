@@ -9,9 +9,8 @@ It is not a radio measure. SINR reaches it only through the delivery
 chain — SINR sets Shannon capacity, which sets the achievable delivery
 rate, which is compared against the segment's bitrate to fill or drain
 the UE buffer; an empty buffer is a playback stall, and stalls are what
-SC counts. A separate SINR-threshold continuity metric would double-count
-radio quality, so none exists. Raw radio quality is reported on its own
-as the `mean_sinr_db` KPI.
+SC counts. Raw radio quality is reported on its own as the
+`mean_sinr_db` KPI, so it is never double-counted here.
 """
 
 from __future__ import annotations

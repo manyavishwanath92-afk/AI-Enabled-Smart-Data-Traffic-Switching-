@@ -1,13 +1,18 @@
-"""Deferred to Phase 2+ per the project build guide.
+"""The intelligence layer: features -> prediction -> utility -> decision.
 
-Will eventually hold: feature_engineering.py, dataset.py, train.py,
-predict.py (XGBoost prediction), utility.py (multi-objective utility
-model), agent.py (AI agent: confidence, safety checks, hysteresis,
-cooldown). No logic exists here in Phase 1 — delivery-mode selection in
-Phase 1 is a fixed, non-AI `mode_selector` callable passed into
-`traffic_sim.simulation.simulator.Simulator`, not this package.
+    feature_engineering.py  live network state -> a feature vector
+    outcomes.py             counterfactual evaluator (training truth +
+                            analytical fallback)
+    dataset.py              manufacture labelled training data
+    train.py                fit and save the XGBoost models
+    predict.py              inference, with graceful fallback
+    utility.py              score the trade-off, explainably
+    agent.py                the decision-maker, with policy and safety
 
-Explicitly out of scope even in later phases: multicast, reinforcement
-learning, deep-learning mobility prediction, real operator-network
-integration.
+XGBoost is the only ML model used here. Deep learning and reinforcement
+learning remain out of scope, as does multicast.
+
+The agent plugs into the simulator through the same `mode_selector` seam
+the fixed rules use, so nothing in the network model needed to change to
+accommodate it.
 """

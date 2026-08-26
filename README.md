@@ -20,12 +20,94 @@ This repository is built incrementally, per the project build guide:
   linking Shannon capacity to the buffer, coherent segment bitrates, and
   playback-continuity KPIs. Still **no AI/ML, no utility model, no AI
   agent, no MBOS/PCF logic, and no dashboard.**
-- **Phase 2b+** — XGBoost prediction, utility model, AI agent
-  (confidence, hysteresis, cooldown), MBOS/PCF, dashboard,
-  always-unicast-vs-AI experiments. These live in already-created but
-  currently empty stub packages: `traffic_sim/ai/`,
-  `traffic_sim/policy/`, `traffic_sim/mbos/`,
+- **Phase 2b/3 (this phase)** — the intelligence layer: features →
+  XGBoost outcome prediction → utility → AI agent → delivery →
+  closed-loop feedback, plus a matched comparison harness. Lives in
+  `traffic_sim/ai/` and `traffic_sim/experiments/`.
+- **Later** — MBOS/PCF as first-class modules and a dashboard. Still
+  empty stubs: `traffic_sim/policy/`, `traffic_sim/mbos/`,
   `traffic_sim/visualization/`.
+
+## The intelligence layer
+
+```
+network state → features → XGBoost (predicts each mode's outcome)
+    → utility (scores the trade-off) → agent (applies policy & safety)
+    → UNICAST / BROADCAST → simulator → changed state → feedback
+```
+
+The three steps are deliberately separate and individually inspectable:
+
+| Step | File | Answers |
+|---|---|---|
+| Features | `ai/feature_engineering.py` | what do we know right now? |
+| Prediction | `ai/predict.py`, `ai/train.py` | what will each mode do? |
+| Utility | `ai/utility.py` | which outcome do we prefer, and why? |
+| Agent | `ai/agent.py` | what are we allowed to do about it? |
+
+**Why ML when the simulator could just compute the answer?** A real
+network cannot try both modes and keep the better one. The simulator can,
+so it manufactures ground truth *at training time only*
+(`ai/dataset.py`). At decision time the agent sees telemetry alone. If
+the model is missing the agent falls back to computing outcomes
+analytically and says so via `PredictionResult.source`, so results are
+never mislabelled as model-driven.
+
+XGBoost is the only ML model used. Two regressors (one per mode) predict
+achievable delivery rate; R² ≈ 0.999, MAE ≈ 0.01 Mbps.
+
+```bash
+python -m traffic_sim.ai.train                      # retrain (models are committed)
+python -m traffic_sim.main --mode-selector ai       # run the agent
+python -m traffic_sim.main --compare                # matched policy comparison
+```
+
+### Measured results
+
+Matched seeds, flash-crowd, 60 ticks. **Default carrier (60 Mbps)** —
+broadcast is genuinely the right answer, and the AI finds it:
+
+| policy | resource saved | continuity | QoE | switches |
+|---|---|---|---|---|
+| always-unicast | 0.000 | 0.713 | 0.201 | 0 |
+| always-broadcast | 0.844 | 1.000 | 0.486 | 0 |
+| rule-by-group-size | 0.293 | 0.820 | 0.264 | 0 |
+| **ai** | **0.821** | **1.000** | **0.490** | 4 |
+
+**Constrained carrier (4 Mbps)** — broadcasting everything now destroys
+service, and the AI backs off:
+
+| policy | resource saved | continuity | QoE | switches |
+|---|---|---|---|---|
+| always-unicast | 0.000 | 0.755 | 0.224 | 0 |
+| always-broadcast | 0.841 | **0.457** | 0.075 | 0 |
+| rule-by-group-size | 0.302 | **0.864** | 0.294 | 0 |
+| **ai** | 0.267 | 0.840 | 0.263 | 98.7 |
+
+**Honest reading.** The AI adapts — broadcast share falls from ~97% to
+~27% as the carrier shrinks, and it beats always-broadcast on continuity
+by a wide margin (0.840 vs 0.457) where blind broadcasting collapses.
+But in this constrained regime the naive group-size rule still edges it
+out on both continuity (0.864) and savings (0.302), and the AI churns
+badly (98.7 switches vs 0).
+
+The cause is a coordination problem, not a tuning problem: every group
+reads the same shared-carrier signal and reacts identically, so they
+leave together, the carrier looks free, and they pile back. Exponentially
+smoothing that signal was tried — churn fell to 79 switches but
+continuity and savings got slightly worse, so it was not kept. Fixing
+this properly needs cell-level admission control (deciding how many
+streams the carrier admits) rather than independent per-group decisions.
+
+Two known limitations worth stating plainly:
+- Tree models cannot extrapolate. An early version trained at a single
+  broadcast capacity learned to ignore that feature and kept choosing
+  broadcast into a starved carrier. `ai/dataset.py` now sweeps capacity
+  settings; `broadcast_capacity_mbps` became the top broadcast feature
+  (0.563 importance). Retrain if you change the physics.
+- At decision time the agent cannot know how many UEs will end up on
+  unicast this tick, so it assumes the whole cell population — the
+  pessimistic case for unicast.
 
 ## Setup
 
@@ -95,7 +177,7 @@ playback stalls in `traffic_sim/kpi/reliability.py`:
 SC = 1 - (total playback interruption time / total playback time)
 ```
 
-SINR is deliberately **not** thresholded to define continuity. It reaches
+SINR does **not** define continuity directly. It reaches
 continuity only through the delivery chain — SINR sets Shannon capacity,
 which sets the achievable delivery rate, which is raced against the
 segment's bitrate to fill or drain the UE buffer; an empty buffer is a

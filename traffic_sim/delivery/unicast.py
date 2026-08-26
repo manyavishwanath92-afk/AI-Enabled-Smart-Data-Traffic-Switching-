@@ -49,6 +49,7 @@ class UnicastDelivery:
         dt: float,
         active_users_in_cell: int,
         unicast_users_in_cell: int | None = None,
+        broadcast_groups_in_cell: int = 1,
     ) -> DeliveryResult:
         n_requesting = len(ues)
         required = required_resource_unicast(n_requesting, config.segment_resource_mbps)

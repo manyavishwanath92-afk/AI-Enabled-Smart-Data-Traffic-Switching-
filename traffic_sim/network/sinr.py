@@ -21,10 +21,8 @@ roughly 5-41 dB, falling with both distance and cell load.
 
 SINR affects service quality only through the delivery chain — it sets
 Shannon capacity, which sets the achievable delivery rate, which drives
-the UE buffer and therefore playback continuity. There is deliberately
-no SINR threshold anywhere: continuity is measured from actual playback
-stalls (see kpi.reliability.service_continuity), not from a radio
-cut-off.
+the UE buffer and therefore playback continuity. Continuity is measured
+from actual playback stalls; see kpi.reliability.service_continuity.
 
 `interference_rise_coeff` (see config.config.SimConfig) is an explicitly
 configurable PoC assumption, NOT a real-world telecom constant. It is

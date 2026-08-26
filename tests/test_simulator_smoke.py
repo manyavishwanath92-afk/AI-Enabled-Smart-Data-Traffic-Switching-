@@ -99,7 +99,7 @@ def test_broadcast_offload_relieves_the_remaining_unicast_users():
 
     # rule-by-group-size offloads the big flash-crowd group to broadcast,
     # leaving the small groups on unicast with the cell largely to themselves.
-    mixed = Simulator(cfg, rule_by_group_size(threshold=20), scenario="flash_crowd")
+    mixed = Simulator(cfg, rule_by_group_size(min_group_size=20), scenario="flash_crowd")
     mixed.run(duration_s=30)
 
     assert mixed.kpi_engine.summary()["mean_achievable_mbps"] > all_unicast.kpi_engine.summary()[

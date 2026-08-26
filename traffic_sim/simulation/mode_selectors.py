@@ -1,13 +1,20 @@
-"""Fixed, non-AI mode_selector implementations for Phase 1 (Guide Step 20).
+"""Delivery-mode selectors that plug into the Simulator's `mode_selector` seam.
 
-None of these are the AI agent — they are deliberately simple, fixed
-rules used to (a) run always-unicast / always-broadcast baselines and
-(b) exercise the Simulator's mode_selector seam that Phase 2's AI agent
-will later occupy. `rule_by_group_size` in particular is explicitly a
-placeholder threshold rule, not intelligence — the guide's core warning
-("do not build a fixed rule such as 'users > X -> broadcast'") applies to
-the *final production decision*, not to this Phase 1 scaffolding used
-purely to prove the simulator's math produces sensible differences.
+A selector answers one question per (cell, segment) group each tick:
+UNICAST or BROADCAST? Everything here except the AI agent is a fixed,
+non-intelligent rule, kept for baselines and comparison:
+
+  always_unicast / always_broadcast  matched baselines (guide Section 22)
+  make_random_selector               scrambles modes, used to generate
+                                     diverse states for training data
+  rule_by_group_size                 a deliberately naive size rule; the
+                                     guide warns against shipping exactly
+                                     this ("users > X -> broadcast"), so it
+                                     exists only as a comparison point
+
+The real decision-maker is `traffic_sim.ai.agent.AIAgent`, which is a
+callable object matching `ModeSelectorFn` and is reached through the
+"ai" factory entry below.
 """
 
 from __future__ import annotations
@@ -37,16 +44,29 @@ def make_random_selector(rng: random.Random) -> ModeSelectorFn:
     return _selector
 
 
-def rule_by_group_size(threshold: int = 20) -> ModeSelectorFn:
+def rule_by_group_size(min_group_size: int = 20) -> ModeSelectorFn:
+    """Broadcast once a group reaches `min_group_size`. Naive on purpose."""
+
     def _selector(segment_id: str, ues: list[UE], cell: Cell, config: SimConfig) -> DeliveryMode:
-        return DeliveryMode.BROADCAST if len(ues) >= threshold else DeliveryMode.UNICAST
+        return DeliveryMode.BROADCAST if len(ues) >= min_group_size else DeliveryMode.UNICAST
 
     return _selector
 
 
+def _make_ai_selector(rng: random.Random, config: SimConfig) -> ModeSelectorFn:
+    # Imported lazily so the simulator core never hard-depends on the AI
+    # layer (or on xgboost being installed).
+    from traffic_sim.ai.agent import AIAgent
+
+    return AIAgent(config)
+
+
+# Each entry takes (rng, config) so selectors that need configuration —
+# the AI agent — can be built the same way as the trivial ones.
 SELECTOR_FACTORY = {
-    "always-unicast": lambda rng: always_unicast,
-    "always-broadcast": lambda rng: always_broadcast,
-    "random": make_random_selector,
-    "rule-by-group-size": lambda rng: rule_by_group_size(),
+    "always-unicast": lambda rng, config: always_unicast,
+    "always-broadcast": lambda rng, config: always_broadcast,
+    "random": lambda rng, config: make_random_selector(rng),
+    "rule-by-group-size": lambda rng, config: rule_by_group_size(),
+    "ai": _make_ai_selector,
 }

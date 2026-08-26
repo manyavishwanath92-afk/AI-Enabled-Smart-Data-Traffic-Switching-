@@ -17,14 +17,21 @@ received. Here both constraints apply, and whichever binds, binds:
       therefore degrades as the cell fills up.
 
   BROADCAST rate = min(segment_bitrate,
-                       shannon_mbps_at_worst_sinr,
-                       broadcast_capacity_mbps)
+                       shannon_mbps_at_worst_sinr / broadcast_groups_in_cell,
+                       broadcast_capacity_mbps / broadcast_groups_in_cell)
 
       One shared transmission serves the whole group, so there is NO
-      division by group size — this is the physical reason broadcast wins
+      division by GROUP SIZE — this is the physical reason broadcast wins
       under a flash crowd. It is sized at the group's WORST-CASE SINR so
       that every member can decode it; a well-covered UE cannot hide a
       poorly-covered one.
+
+      It IS divided by the number of concurrent broadcast groups in the
+      cell, because they share one broadcast carrier. Broadcasting is
+      cheap per recipient but not free per stream: put every segment on
+      the carrier and each gets a thin slice. That is what stops
+      "broadcast everything" from being the trivially correct policy, and
+      what the decision layer has to reason about.
 
 Neither rate exceeds the segment's own bitrate: you cannot usefully
 receive a stream faster than it was encoded.
@@ -50,9 +57,18 @@ def broadcast_achievable_mbps(
     shannon_mbps_at_worst_sinr: float,
     broadcast_capacity_mbps: float,
     segment_bitrate_mbps: float,
+    broadcast_groups_in_cell: int = 1,
 ) -> float:
-    """Shared broadcast rate — independent of how many UEs are listening."""
-    return max(min(segment_bitrate_mbps, shannon_mbps_at_worst_sinr, broadcast_capacity_mbps), 0.0)
+    """Shared broadcast rate.
+
+    Independent of how many UEs are listening (that is broadcast's whole
+    advantage), but divided across the concurrent broadcast streams the
+    cell is carrying, which share one carrier.
+    """
+    share = max(broadcast_groups_in_cell, 1)
+    radio_limited = shannon_mbps_at_worst_sinr / share
+    carrier_limited = broadcast_capacity_mbps / share
+    return max(min(segment_bitrate_mbps, radio_limited, carrier_limited), 0.0)
 
 
 def delivered_seconds_of_content(achievable_mbps: float, segment_bitrate_mbps: float, dt: float) -> float:

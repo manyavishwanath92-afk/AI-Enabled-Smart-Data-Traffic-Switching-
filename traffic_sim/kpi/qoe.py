@@ -8,9 +8,8 @@ continuity, each normalized to [0, 1]:
 Both terms are experience measures, not radio measures. Radio quality
 reaches QoE only through the delivery chain (SINR -> Shannon capacity ->
 achievable rate -> buffer), consistent with service continuity being
-defined from actual playback stalls rather than an SINR threshold — see
-kpi.reliability. Raw radio quality is reported separately as
-`mean_sinr_db`.
+defined from actual playback stalls — see kpi.reliability. Raw radio
+quality is reported separately as `mean_sinr_db`.
 """
 
 from __future__ import annotations
