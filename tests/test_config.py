@@ -8,12 +8,12 @@ def test_defaults_are_valid():
     cfg.validate()  # should not raise
 
 
-def test_interference_coeff_default_and_configurable():
+def test_interference_rise_coeff_default_and_configurable():
     cfg = SimConfig.default()
-    assert cfg.interference_coeff == 0.02
-    cfg2 = cfg.with_overrides(interference_coeff=0.1)
-    assert cfg2.interference_coeff == 0.1
-    assert cfg.interference_coeff == 0.02  # original untouched (dataclasses.replace)
+    assert cfg.interference_rise_coeff == 0.02
+    cfg2 = cfg.with_overrides(interference_rise_coeff=0.1)
+    assert cfg2.interference_rise_coeff == 0.1
+    assert cfg.interference_rise_coeff == 0.02  # original untouched (dataclasses.replace)
 
 
 def test_transition_and_buffer_fields_configurable():
@@ -39,7 +39,7 @@ def test_reserved_phase2_fields_present_but_inert():
         {"num_cells": 0},
         {"num_ues": -1},
         {"cellular_bandwidth_hz": 0},
-        {"interference_coeff": -0.1},
+        {"interference_rise_coeff": -0.1},
         {"initial_buffer_seconds": -1.0},
     ],
 )

@@ -61,30 +61,30 @@ pytest
 - Multicast is out of scope entirely (deferred indefinitely per the source
   use case). Deep-learning mobility prediction, reinforcement learning, and
   real operator-network integration are also out of scope.
-## Interference models (Phase 2)
+## Interference model
 
-The interference formula inherited from the old PoC,
-`I_linear = interference_coeff * active_users` (Guide Section 8.4, flagged
-there as "synthetic, not a physical interference model"), is
-dimensionally unsound: it yields a bare milliwatt figure, while a
-received signal at these Tx/path-loss defaults is ~6e-9 mW. At 30 active
-users interference is 0.6 mW — roughly eight orders of magnitude above
-the signal — so SINR collapsed to ~1e-9, Shannon capacity to ~0, and
-`service_continuity` read 0.0000 in every Phase 1 run.
+Interference uses a calibrated **noise-rise** (interference-over-thermal)
+model, in `config/config.py` / `traffic_sim/network/sinr.py`:
 
-Phase 2 adds a calibrated **noise-rise** (interference-over-thermal)
-model, selected by `interference_model` in `config/config.py`:
+```
+I_linear = interference_rise_coeff * active_users * noise_linear
+```
 
-| model | formula | behaviour |
-|---|---|---|
-| `noise_rise` (default) | `coeff × active_users × noise_linear` | SINR ≈ 5–41 dB, falling with distance and cell load |
-| `legacy_linear_mw` | `coeff × active_users` | Phase 1 baseline; degenerate, kept for comparison |
+Interference is expressed *relative to the noise floor* rather than as
+an absolute milliwatt figure, which keeps it dimensionally consistent
+with the signal and noise terms it is summed against. At the defaults
+this yields SINR spanning roughly 5–41 dB, falling with both distance
+and cell load.
 
-Expressing interference relative to the noise floor makes it
-dimensionally consistent with the signal and noise terms it is summed
-against. The legacy model is preserved and selectable — running with it
-reproduces Phase 1's original numbers, including the fact that unicast
-and broadcast become indistinguishable under it.
+An earlier formula inherited from an older PoC,
+`I_linear = coeff * active_users` (no noise term), was dimensionally
+unsound: it produced a bare milliwatt figure, while a received signal at
+these Tx/path-loss defaults is ~6e-9 mW. At 30 active users that
+interference term was 0.6 mW — roughly eight orders of magnitude above
+the signal — so SINR collapsed to ~1e-9 regardless of distance or load,
+Shannon capacity collapsed to ~0, and `service_continuity` read 0.0000
+in every run. It has been removed rather than kept as a selectable
+option: this simulator implements one interference model.
 
 **The radio chain now gates delivery.** In Phase 1 SINR and Shannon
 capacity were computed, reported, and then discarded; throughput was

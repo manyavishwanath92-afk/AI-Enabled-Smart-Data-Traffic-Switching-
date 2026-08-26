@@ -63,30 +63,15 @@ def test_flash_crowd_shows_a_much_larger_broadcast_advantage_than_a_sparse_scena
 # --- Phase 2: radio conditions now drive delivery ---------------------------
 
 
-def test_service_continuity_is_no_longer_degenerate_zero():
-    """The concrete regression this phase fixes.
-
-    Under Phase 1's inherited interference constant, SINR collapsed so far
-    that the 5 dB threshold was never met and service_continuity read
-    0.0000 in every run. With the calibrated noise-rise model it must be a
-    real, non-zero measurement.
+def test_service_continuity_is_a_real_nonzero_measurement():
+    """The regression the noise-rise model fixes: a naive, dimensionally
+    unsound interference formula would collapse SINR so far that the 5 dB
+    threshold is never met and service_continuity reads 0.0000 in every
+    run. The noise-rise model must produce a real, non-zero measurement.
     """
     summary = run_matched("flash_crowd", always_broadcast)
     assert summary["service_continuity"] > 0.0
     assert summary["mean_sinr_db"] > 5.0
-
-
-def test_legacy_interference_model_reproduces_the_phase1_degeneracy():
-    """The old model is preserved as a documented baseline, not deleted."""
-    cfg = SimConfig.default().with_overrides(
-        interference_model="legacy_linear_mw", random_seed=123, num_ues=100
-    )
-    sim = Simulator(cfg, always_broadcast, scenario="flash_crowd")
-    sim.run(duration_s=30)
-    summary = sim.kpi_engine.summary()
-
-    assert summary["service_continuity"] == pytest.approx(0.0)
-    assert summary["mean_achievable_mbps"] == pytest.approx(0.0, abs=1e-6)
 
 
 def test_flash_crowd_unicast_starves_while_broadcast_sustains_playback():

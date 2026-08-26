@@ -9,31 +9,28 @@ or noise it MUST be converted to linear milliwatts via
 
     SINR = Signal_linear / (Interference_linear + Noise_linear)
 
-`interference_coeff` (see config.config.SimConfig) is an explicitly
+INTERFERENCE MODEL — "noise rise" (interference-over-thermal):
+
+    I_linear = interference_rise_coeff * active_users * noise_linear
+
+Interference is expressed as a multiple of the noise floor rather than
+as a bare milliwatt figure, which keeps it dimensionally consistent with
+the signal and noise terms it is summed against. At the project's
+default Tx power / noise floor / path loss this yields SINR spanning
+roughly 5-41 dB, falling with both distance and cell load, so the 5 dB
+service-continuity threshold actually bites at the cell edge under heavy
+load.
+
+`interference_rise_coeff` (see config.config.SimConfig) is an explicitly
 configurable PoC assumption, NOT a real-world telecom constant. It is
 never hardcoded here — every call site must pass it in explicitly from
 config, so changing it in config.py alone is enough to run a different
 interference sensitivity experiment.
-
-TWO INTERFERENCE MODELS are available (full rationale in
-config.config's module docstring):
-
-  LEGACY_LINEAR_MW  I = coeff * active_users            (Phase 1 baseline)
-  NOISE_RISE        I = coeff * active_users * noise    (Phase 2 default)
-
-`compute_sinr`'s `model` argument defaults to LEGACY_LINEAR_MW purely for
-backwards compatibility, so Phase 1 callers and unit tests keep their
-exact original behaviour. The simulator does NOT rely on that default —
-it passes `config.interference_model` explicitly, and the config default
-is "noise_rise".
 """
 
 from __future__ import annotations
 
 import math
-
-LEGACY_LINEAR_MW = "legacy_linear_mw"
-NOISE_RISE = "noise_rise"
 
 
 def dbm_to_linear_mw(dbm: float) -> float:
@@ -41,25 +38,13 @@ def dbm_to_linear_mw(dbm: float) -> float:
     return 10 ** (dbm / 10)
 
 
-def interference_linear(active_users: int, interference_coeff: float) -> float:
-    """I_linear = interference_coeff * active_users.
-
-    Deliberately simplified, synthetic, linear-domain assumption
-    (documented in config.config.SimConfig.interference_coeff) — not a
-    physical interference model, and not something derived from a dBm
-    reading, so it is not passed through dbm_to_linear_mw.
-    """
-    return interference_coeff * active_users
-
-
 def interference_noise_rise_linear(active_users: int, interference_rise_coeff: float, noise_linear: float) -> float:
     """I_linear = interference_rise_coeff * active_users * noise_linear.
 
     Interference-over-thermal ("noise rise"): interference is expressed
     as a multiple of the noise floor rather than as an absolute milliwatt
-    figure. That keeps it dimensionally consistent with the signal and
-    noise terms it is summed against, which the legacy model is not — see
-    config.config's module docstring for the numbers.
+    figure, which keeps it dimensionally consistent with the signal and
+    noise terms it is summed against in compute_sinr.
     """
     return interference_rise_coeff * active_users * noise_linear
 
@@ -73,29 +58,17 @@ def compute_sinr(
     rx_power_dbm: float,
     active_users: int,
     noise_floor_dbm: float,
-    interference_coeff: float,
-    model: str = LEGACY_LINEAR_MW,
+    interference_rise_coeff: float,
 ) -> float:
     """SINR = Signal_linear / (Interference_linear + Noise_linear).
 
     All three terms are converted to / expressed in linear units before
-    the ratio is formed; no dBm arithmetic occurs here.
-
-    `model` selects how the interference term is computed and defaults to
-    LEGACY_LINEAR_MW so existing Phase 1 callers are unaffected. For
-    NOISE_RISE, `interference_coeff` carries
-    config.interference_rise_coeff (the caller picks the matching
-    coefficient for the model it asks for).
+    the ratio is formed; no dBm arithmetic occurs here. Interference uses
+    the noise-rise model — see module docstring.
     """
     signal_linear = dbm_to_linear_mw(rx_power_dbm)
     noise_linear = dbm_to_linear_mw(noise_floor_dbm)
-
-    if model == NOISE_RISE:
-        interference = interference_noise_rise_linear(active_users, interference_coeff, noise_linear)
-    elif model == LEGACY_LINEAR_MW:
-        interference = interference_linear(active_users, interference_coeff)
-    else:
-        raise ValueError(f"unknown interference model: {model!r}")
+    interference = interference_noise_rise_linear(active_users, interference_rise_coeff, noise_linear)
 
     denominator = interference + noise_linear
     if denominator <= 0:

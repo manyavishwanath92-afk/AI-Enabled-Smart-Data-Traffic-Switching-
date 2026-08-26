@@ -48,25 +48,16 @@ def compute_ue_radio_state(
     (config.cellular_bandwidth_hz for unicast,
     config.broadcast_bandwidth_hz for broadcast), so the returned
     Shannon capacity is the capacity of that carrier at this UE's SINR.
-
-    The interference model is taken from config.interference_model, with
-    the coefficient that matches it.
     """
     distance_km = math.hypot(ue.x_km - cell.center_x_km, ue.y_km - cell.center_y_km)
     pl_db = path_loss_db(distance_km, config.path_loss_const_a, config.path_loss_const_b)
     rx_dbm = received_power_dbm(config.tx_power_dbm, pl_db)
 
-    coeff = (
-        config.interference_rise_coeff
-        if config.interference_model == "noise_rise"
-        else config.interference_coeff
-    )
     sinr_linear = compute_sinr(
         rx_dbm,
         active_users_in_cell,
         config.noise_floor_dbm,
-        coeff,
-        model=config.interference_model,
+        config.interference_rise_coeff,
     )
 
     shannon_mbps = shannon_capacity_bps(bandwidth_hz, sinr_linear) / 1_000_000.0

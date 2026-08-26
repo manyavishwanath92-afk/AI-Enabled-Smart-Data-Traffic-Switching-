@@ -14,33 +14,27 @@ standards-derived values — they exist so the simulator has *a* consistent,
 documented radio model to reason about, and every one of them is meant to
 be experimented with by changing this file, not the code that consumes it.
 
-INTERFERENCE MODELS (`interference_model`) — two are available, and the
-choice is always explicit so nothing changes silently:
+INTERFERENCE MODEL — "noise rise" (interference-over-thermal):
 
-  "legacy_linear_mw" (Phase 1 baseline, preserved for comparison)
-      I_linear = interference_coeff * active_users
+    I_linear = interference_rise_coeff * active_users * noise_linear
 
-      Carried over verbatim from the old PoC. It is dimensionally
-      unsound: it produces a bare milliwatt figure, while a received
-      signal at these Tx/path-loss defaults is ~6e-9 mW. At 30 active
-      users interference is 0.6 mW — about eight orders of magnitude
-      above the signal — so SINR collapses to ~1e-9, Shannon capacity to
-      ~0, and the SINR service-continuity threshold is never met. Kept
-      selectable so Phase 1's original numbers remain reproducible.
+Interference is expressed *relative to the noise floor* rather than as
+an absolute milliwatt figure, which makes it dimensionally consistent
+with the signal and noise terms it is summed against. At the defaults
+below this yields SINR spanning roughly 5-41 dB, falling with both
+distance and cell load, so the 5 dB continuity threshold actually bites
+at the cell edge under heavy load.
 
-  "noise_rise" (Phase 2 default, calibrated)
-      I_linear = interference_rise_coeff * active_users * noise_linear
+An earlier, dimensionally-unsound formula (`coeff * active_users` with
+no noise term, carried over verbatim from an older PoC) produced a bare
+milliwatt figure roughly eight orders of magnitude larger than a
+realistic received signal, which collapsed SINR to ~1e-9 regardless of
+distance or load and made the SINR service-continuity threshold
+impossible to meet. It has been removed rather than kept selectable —
+this simulator implements one interference model, and it is this one.
 
-      Interference-over-thermal / "noise rise": interference is expressed
-      *relative to the noise floor* rather than as an absolute milliwatt
-      figure, which makes it dimensionally consistent with the signal and
-      noise terms it is summed against. At the defaults below this yields
-      SINR spanning roughly 5-41 dB, falling with both distance and cell
-      load, so the 5 dB continuity threshold actually bites at the cell
-      edge under heavy load.
-
-Still a simplified PoC model in both cases — neither is a physical
-multi-cell interference calculation.
+Still a simplified PoC model — not a physical multi-cell interference
+calculation.
 """
 
 from __future__ import annotations
@@ -66,19 +60,11 @@ class SimConfig:
     # --- Radio chain (Guide Section 8 / 12.2 / 27 — old-PoC starting values) ---
     tx_power_dbm: float = 46.0
     noise_floor_dbm: float = -104.0
-    # Which interference model the simulator uses — see module docstring.
-    # "noise_rise" (Phase 2, calibrated) or "legacy_linear_mw" (Phase 1).
-    interference_model: str = "noise_rise"
     # Explicitly configurable PoC assumption, NOT a real-world telecom
-    # interference constant. Used ONLY by the "legacy_linear_mw" model:
-    # interference_linear = interference_coeff * active_users, computed
-    # directly in linear mW. Change this value to experiment with legacy
+    # interference constant — see module docstring for the noise-rise
+    # formula. interference_linear = interference_rise_coeff *
+    # active_users * noise_linear. Change this value to experiment with
     # interference sensitivity — no code changes needed.
-    interference_coeff: float = 0.02
-    # Used ONLY by the "noise_rise" model: interference is this many
-    # noise-floors' worth of power per active user. Kept as a separate
-    # field from interference_coeff so the two models can be tuned
-    # independently and neither one's meaning depends on the other.
     interference_rise_coeff: float = 0.02
     path_loss_const_a: float = 128.1
     path_loss_const_b: float = 37.6
@@ -146,14 +132,8 @@ class SimConfig:
             raise ValueError("cell capacities must be > 0")
         if self.segment_resource_mbps <= 0:
             raise ValueError("segment_resource_mbps must be > 0")
-        if self.interference_coeff < 0:
-            raise ValueError("interference_coeff must be >= 0")
         if self.interference_rise_coeff < 0:
             raise ValueError("interference_rise_coeff must be >= 0")
-        if self.interference_model not in ("noise_rise", "legacy_linear_mw"):
-            raise ValueError(
-                f"interference_model must be 'noise_rise' or 'legacy_linear_mw', got {self.interference_model!r}"
-            )
         if self.segment_bitrate_mbps_min <= 0:
             raise ValueError("segment_bitrate_mbps_min must be > 0")
         if self.segment_bitrate_mbps_max < self.segment_bitrate_mbps_min:

@@ -108,7 +108,7 @@ def test_cell_edge_ue_receives_less_content_than_cell_centre_ue():
     rate, hence less content received. In Phase 1 these were identical
     because throughput was resource-only.
     """
-    cfg = SimConfig.default()  # noise_rise model by default
+    cfg = SimConfig.default()
     cell = Cell(cell_id="c0", center_x_km=0, center_y_km=0, maximum_capacity_mbps=1000.0, broadcast_capacity_mbps=600.0)
     segment = Segment(segment_id="s0", size_mb=5.0, duration_sec=10.0)
 
