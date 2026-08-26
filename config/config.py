@@ -9,7 +9,7 @@ configuration without touching simulation/network/delivery logic.
 IMPORTANT SIMPLIFICATION NOTICE: several defaults below are simplified
 PoC assumptions carried over from an earlier winning buildathon PoC
 (transmit power, noise floor, interference coefficient, path-loss
-constants, SINR threshold). They are NOT real-world telecom constants or
+constants). They are NOT real-world telecom constants or
 standards-derived values — they exist so the simulator has *a* consistent,
 documented radio model to reason about, and every one of them is meant to
 be experimented with by changing this file, not the code that consumes it.
@@ -22,16 +22,20 @@ Interference is expressed *relative to the noise floor* rather than as
 an absolute milliwatt figure, which makes it dimensionally consistent
 with the signal and noise terms it is summed against. At the defaults
 below this yields SINR spanning roughly 5-41 dB, falling with both
-distance and cell load, so the 5 dB continuity threshold actually bites
-at the cell edge under heavy load.
+distance and cell load.
 
 An earlier, dimensionally-unsound formula (`coeff * active_users` with
 no noise term, carried over verbatim from an older PoC) produced a bare
 milliwatt figure roughly eight orders of magnitude larger than a
 realistic received signal, which collapsed SINR to ~1e-9 regardless of
-distance or load and made the SINR service-continuity threshold
-impossible to meet. It has been removed rather than kept selectable —
-this simulator implements one interference model, and it is this one.
+distance or load and left the delivery chain unable to move any content
+at all. It has been removed rather than kept selectable — this simulator
+implements one interference model, and it is this one.
+
+There is deliberately no SINR threshold parameter: SINR affects service
+quality only through the delivery chain (Shannon capacity -> achievable
+rate -> buffer -> playback stalls), and service continuity is measured
+from actual stalls rather than from a radio cut-off.
 
 Still a simplified PoC model — not a physical multi-cell interference
 calculation.
@@ -68,7 +72,6 @@ class SimConfig:
     interference_rise_coeff: float = 0.02
     path_loss_const_a: float = 128.1
     path_loss_const_b: float = 37.6
-    sinr_threshold_db: float = 5.0  # -> ~3.16 linear, service-continuity baseline
 
     # --- Resource / capacity model (Guide Section 9, 26 — explicit & configurable,
     #     deliberately NOT reusing the old PoC's fixed 50 Mbps cell capacity /
@@ -138,8 +141,6 @@ class SimConfig:
             raise ValueError("segment_bitrate_mbps_min must be > 0")
         if self.segment_bitrate_mbps_max < self.segment_bitrate_mbps_min:
             raise ValueError("segment_bitrate_mbps_max must be >= segment_bitrate_mbps_min")
-        if self.sinr_threshold_db < 0:
-            raise ValueError("sinr_threshold_db must be >= 0")
         if self.initial_buffer_seconds < 0:
             raise ValueError("initial_buffer_seconds must be >= 0")
         if self.transition_time_seconds < 0 or self.safety_margin_seconds < 0:

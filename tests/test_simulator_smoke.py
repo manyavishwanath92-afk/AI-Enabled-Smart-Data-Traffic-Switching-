@@ -64,10 +64,11 @@ def test_flash_crowd_shows_a_much_larger_broadcast_advantage_than_a_sparse_scena
 
 
 def test_service_continuity_is_a_real_nonzero_measurement():
-    """The regression the noise-rise model fixes: a naive, dimensionally
-    unsound interference formula would collapse SINR so far that the 5 dB
-    threshold is never met and service_continuity reads 0.0000 in every
-    run. The noise-rise model must produce a real, non-zero measurement.
+    """Service continuity is measured from actual playback stalls, so it
+    only reads non-zero if the whole chain works: the noise-rise model
+    must give usable SINR, which must give enough Shannon capacity, which
+    must give an achievable rate near the segment bitrate, which must keep
+    buffers off empty. A break anywhere upstream shows up here as 0.
     """
     summary = run_matched("flash_crowd", always_broadcast)
     assert summary["service_continuity"] > 0.0
@@ -82,7 +83,7 @@ def test_flash_crowd_unicast_starves_while_broadcast_sustains_playback():
     broadcast_summary = run_matched("flash_crowd", always_broadcast)
 
     assert broadcast_summary["mean_achievable_mbps"] > unicast_summary["mean_achievable_mbps"]
-    assert broadcast_summary["playback_continuity"] > unicast_summary["playback_continuity"]
+    assert broadcast_summary["service_continuity"] > unicast_summary["service_continuity"]
     assert broadcast_summary["buffer_starvation_rate"] < unicast_summary["buffer_starvation_rate"]
     assert broadcast_summary["total_rebuffering_events"] < unicast_summary["total_rebuffering_events"]
 

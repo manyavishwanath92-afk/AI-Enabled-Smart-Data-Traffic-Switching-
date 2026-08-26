@@ -1,8 +1,9 @@
+import pytest
+
 from config.config import SimConfig
 from traffic_sim.delivery.result import DeliveryResult
 from traffic_sim.kpi.metrics import KPIEngine
 from traffic_sim.kpi.qoe import compute_qoe
-from traffic_sim.network.sinr import sinr_threshold_linear
 from traffic_sim.simulation.user import UE
 
 
@@ -47,33 +48,33 @@ def test_resource_savings_positive_when_broadcast_cheaper():
 
 
 def test_compute_qoe_monotonic_in_buffer():
-    cfg = SimConfig.default()
-    threshold = sinr_threshold_linear(cfg.sinr_threshold_db)
-    low_buffer_ue = UE(ue_id="a", x_km=0, y_km=0, buffer_seconds=1.0, sinr_linear=threshold)
-    high_buffer_ue = UE(ue_id="b", x_km=0, y_km=0, buffer_seconds=30.0, sinr_linear=threshold)
+    low_buffer_ue = UE(ue_id="a", x_km=0, y_km=0, buffer_seconds=1.0)
+    high_buffer_ue = UE(ue_id="b", x_km=0, y_km=0, buffer_seconds=30.0)
 
-    low_qoe = compute_qoe(low_buffer_ue, threshold)
-    high_qoe = compute_qoe(high_buffer_ue, threshold)
-
-    assert high_qoe >= low_qoe
+    assert compute_qoe(high_buffer_ue) >= compute_qoe(low_buffer_ue)
 
 
 def test_compute_qoe_starved_state_on_zero_buffer():
     from traffic_sim.simulation.user import QoEState
 
-    cfg = SimConfig.default()
-    threshold = sinr_threshold_linear(cfg.sinr_threshold_db)
     ue = UE(ue_id="a", x_km=0, y_km=0, buffer_seconds=0.0)
-    compute_qoe(ue, threshold)
+    compute_qoe(ue)
     assert ue.qoe_state == QoEState.STARVED
 
 
-def test_playback_continuity_and_radio_kpis_are_recorded():
+def test_compute_qoe_ignores_sinr():
+    """QoE is an experience measure; radio reaches it only via the buffer."""
+    good_radio = UE(ue_id="a", x_km=0, y_km=0, buffer_seconds=10.0, sinr_linear=1000.0)
+    bad_radio = UE(ue_id="b", x_km=0, y_km=0, buffer_seconds=10.0, sinr_linear=0.001)
+
+    assert compute_qoe(good_radio) == compute_qoe(bad_radio)
+
+
+def test_service_continuity_and_radio_kpis_are_recorded():
     cfg = SimConfig.default()
     engine = KPIEngine(cfg)
-    threshold = sinr_threshold_linear(cfg.sinr_threshold_db)
-    healthy = UE(ue_id="ok", x_km=0, y_km=0, buffer_seconds=5.0, sinr_linear=threshold * 4)
-    starved = UE(ue_id="dry", x_km=0, y_km=0, buffer_seconds=0.0, sinr_linear=threshold * 4)
+    healthy = UE(ue_id="ok", x_km=0, y_km=0, buffer_seconds=5.0, sinr_linear=12.0)
+    starved = UE(ue_id="dry", x_km=0, y_km=0, buffer_seconds=0.0, sinr_linear=12.0)
     result = DeliveryResult(
         mode="unicast", segment_id="s0", cell_id="c0", n_requesting=2,
         required_resource_mbps=4.0, congestion=0.2,
@@ -84,11 +85,35 @@ def test_playback_continuity_and_radio_kpis_are_recorded():
         tick=1, sim_time_s=1.0, ues=[healthy, starved], delivery_results=[result], dt=1.0
     )
 
-    # One of two UEs stalled this tick.
-    assert record.playback_continuity == 0.5
+    # One of two UE-ticks was an interruption -> SC = 1 - 1/2 = 0.5
+    assert record.service_continuity == 0.5
     assert record.rebuffering_events == 1
     assert record.mean_achievable_mbps == 1.25
     assert record.mean_sinr_db > 0
+
+
+def test_service_continuity_matches_the_sc_formula():
+    """SC = 1 - (interruption time / total playback time).
+
+    One UE, ten ticks, stalled for three of them -> SC = 1 - 3/10 = 0.7.
+    """
+    cfg = SimConfig.default()
+    engine = KPIEngine(cfg)
+    ue = UE(ue_id="u", x_km=0, y_km=0, buffer_seconds=5.0)
+    result = DeliveryResult(
+        mode="unicast", segment_id="s0", cell_id="c0", n_requesting=1,
+        required_resource_mbps=2.0, congestion=0.1, delivered_ue_ids=["u"],
+    )
+    for tick in range(1, 11):
+        # Stall on ticks 4, 5 and 6 only.
+        ue.buffer_seconds = 0.0 if tick in (4, 5, 6) else 5.0
+        record = engine.record_tick(
+            tick=tick, sim_time_s=float(tick), ues=[ue], delivery_results=[result], dt=1.0
+        )
+
+    assert ue.playback_ticks == 10
+    assert ue.stall_ticks == 3
+    assert record.service_continuity == pytest.approx(0.7)
 
 
 def test_rebuffering_counts_one_event_per_outage_not_per_tick():
@@ -106,7 +131,7 @@ def test_rebuffering_counts_one_event_per_outage_not_per_tick():
 
     assert starved.stall_ticks == 3
     assert record.rebuffering_events == 1  # one outage, not three
-    assert record.playback_continuity == 0.0
+    assert record.service_continuity == 0.0
 
 
 def test_export_csv_writes_header_and_row(tmp_path):

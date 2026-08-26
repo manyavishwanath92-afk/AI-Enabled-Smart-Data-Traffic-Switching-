@@ -13,8 +13,6 @@ from traffic_sim.network.sinr import (
     compute_sinr,
     dbm_to_linear_mw,
     interference_noise_rise_linear,
-    service_continuity_ratio,
-    sinr_threshold_linear,
     sinr_to_db,
 )
 
@@ -46,18 +44,6 @@ def test_dbm_to_linear_mw_conversion():
     assert dbm_to_linear_mw(0.0) == pytest.approx(1.0)
     assert dbm_to_linear_mw(10.0) == pytest.approx(10.0)
     assert dbm_to_linear_mw(-10.0) == pytest.approx(0.1)
-
-
-def test_sinr_threshold_linear_worked_example():
-    # 5 dB -> ~3.16 linear
-    assert sinr_threshold_linear(5.0) == pytest.approx(3.1623, rel=1e-3)
-
-
-def test_service_continuity_ratio():
-    threshold = sinr_threshold_linear(5.0)
-    observations = [threshold + 1, threshold - 1, threshold, threshold * 2]
-    ratio = service_continuity_ratio(observations, threshold)
-    assert ratio == pytest.approx(3 / 4)
 
 
 def test_shannon_capacity_worked_example_20_5_mbps():
@@ -119,9 +105,9 @@ def test_sinr_falls_monotonically_with_cell_load(distance_km):
 
 
 def test_sinr_stays_in_a_usable_band_across_the_operating_range():
-    """Across the whole distance/load matrix SINR must stay in a band where
-    the 5 dB continuity threshold is meaningful — sometimes comfortably met,
-    never absurdly high or collapsed."""
+    """Across the whole distance/load matrix SINR must stay in a plausible
+    band — never collapsed to nothing, never absurdly high — so the
+    Shannon capacity it feeds into stays meaningful."""
     values = [_sinr_db(d, n) for d in (0.3, 1.0, 1.5, 2.0) for n in (10, 30, 60, 100)]
     assert min(values) > 5.0
     assert max(values) < 45.0

@@ -82,9 +82,25 @@ unsound: it produced a bare milliwatt figure, while a received signal at
 these Tx/path-loss defaults is ~6e-9 mW. At 30 active users that
 interference term was 0.6 mW — roughly eight orders of magnitude above
 the signal — so SINR collapsed to ~1e-9 regardless of distance or load,
-Shannon capacity collapsed to ~0, and `service_continuity` read 0.0000
-in every run. It has been removed rather than kept as a selectable
+Shannon capacity collapsed to ~0, and the delivery chain could not move
+any content at all. It has been removed rather than kept as a selectable
 option: this simulator implements one interference model.
+
+## Service continuity
+
+Service continuity has exactly one definition, computed from actual
+playback stalls in `traffic_sim/kpi/reliability.py`:
+
+```
+SC = 1 - (total playback interruption time / total playback time)
+```
+
+SINR is deliberately **not** thresholded to define continuity. It reaches
+continuity only through the delivery chain — SINR sets Shannon capacity,
+which sets the achievable delivery rate, which is raced against the
+segment's bitrate to fill or drain the UE buffer; an empty buffer is a
+stall, and stalls are what SC counts. Raw radio quality is reported
+separately as the `mean_sinr_db` KPI.
 
 **The radio chain now gates delivery.** In Phase 1 SINR and Shannon
 capacity were computed, reported, and then discarded; throughput was

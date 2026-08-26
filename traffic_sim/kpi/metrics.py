@@ -20,11 +20,10 @@ from traffic_sim.kpi.qoe import compute_qoe
 from traffic_sim.kpi.reliability import (
     buffer_starvation_rate,
     observe_playback,
-    playback_continuity,
     service_continuity,
     successful_delivery_ratio,
 )
-from traffic_sim.network.sinr import sinr_threshold_linear, sinr_to_db
+from traffic_sim.network.sinr import sinr_to_db
 from traffic_sim.simulation.buffer import group_safety_buffer
 from traffic_sim.simulation.user import UE
 
@@ -43,10 +42,10 @@ class KPIRecord:
     mean_buffer_seconds: float
     min_group_buffer_seconds: float
     buffer_starvation_rate: float
-    # SINR-threshold half of the guide's service-continuity KPI (Sec. 11).
+    # SC = 1 - (playback interruption time / total playback time). The
+    # single definition of service continuity — measured from actual
+    # stalls, not from any SINR threshold.
     service_continuity: float
-    # Actual-playback half of the same KPI: fraction of UE-ticks not stalled.
-    playback_continuity: float
     rebuffering_events: int
     # Phase 2 radio-chain visibility: what SINR the UEs actually saw and
     # what delivery rate that translated into after resource sharing.
@@ -62,7 +61,6 @@ class KPIRecord:
 class KPIEngine:
     def __init__(self, config: SimConfig):
         self._config = config
-        self._threshold_linear = sinr_threshold_linear(config.sinr_threshold_db)
         self._records: list[KPIRecord] = []
 
     def record_tick(
@@ -98,8 +96,9 @@ class KPIEngine:
         min_group_buffer = group_safety_buffer(ues)
         starvation = buffer_starvation_rate(ues)
 
+        # Radio quality, reported on its own — it influences service
+        # continuity only through the delivery chain, never as a threshold.
         sinr_observations = [ue.sinr_linear for ue in ues if ue.sinr_linear is not None]
-        continuity = service_continuity(sinr_observations, self._threshold_linear)
         mean_sinr_db = (
             statistics.mean(sinr_to_db(s) for s in sinr_observations if s > 0)
             if any(s > 0 for s in sinr_observations)
@@ -108,7 +107,7 @@ class KPIEngine:
 
         # Advance playback counters once per tick, then report continuity.
         observe_playback(ues)
-        playback = playback_continuity(ues)
+        continuity = service_continuity(ues)
         total_rebuffering = sum(ue.rebuffering_events for ue in ues)
 
         achievable_values = [
@@ -123,7 +122,7 @@ class KPIEngine:
             se_values.append(spectrum_efficiency(delivered_bits, bw_hz, dt))
         mean_se = statistics.mean(se_values) if se_values else 0.0
 
-        mean_qoe = statistics.mean(compute_qoe(ue, self._threshold_linear) for ue in ues) if ues else 0.0
+        mean_qoe = statistics.mean(compute_qoe(ue) for ue in ues) if ues else 0.0
 
         record = KPIRecord(
             tick=tick,
@@ -139,7 +138,6 @@ class KPIEngine:
             min_group_buffer_seconds=min_group_buffer,
             buffer_starvation_rate=starvation,
             service_continuity=continuity,
-            playback_continuity=playback,
             rebuffering_events=total_rebuffering,
             mean_sinr_db=mean_sinr_db,
             mean_achievable_mbps=mean_achievable,
@@ -175,7 +173,6 @@ class KPIEngine:
             "min_group_buffer_seconds",
             "buffer_starvation_rate",
             "service_continuity",
-            "playback_continuity",
             "mean_sinr_db",
             "mean_achievable_mbps",
             "successful_delivery_ratio",

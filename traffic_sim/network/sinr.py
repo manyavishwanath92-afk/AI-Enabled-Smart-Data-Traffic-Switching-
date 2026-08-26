@@ -17,9 +17,14 @@ Interference is expressed as a multiple of the noise floor rather than
 as a bare milliwatt figure, which keeps it dimensionally consistent with
 the signal and noise terms it is summed against. At the project's
 default Tx power / noise floor / path loss this yields SINR spanning
-roughly 5-41 dB, falling with both distance and cell load, so the 5 dB
-service-continuity threshold actually bites at the cell edge under heavy
-load.
+roughly 5-41 dB, falling with both distance and cell load.
+
+SINR affects service quality only through the delivery chain — it sets
+Shannon capacity, which sets the achievable delivery rate, which drives
+the UE buffer and therefore playback continuity. There is deliberately
+no SINR threshold anywhere: continuity is measured from actual playback
+stalls (see kpi.reliability.service_continuity), not from a radio
+cut-off.
 
 `interference_rise_coeff` (see config.config.SimConfig) is an explicitly
 configurable PoC assumption, NOT a real-world telecom constant. It is
@@ -49,11 +54,6 @@ def interference_noise_rise_linear(active_users: int, interference_rise_coeff: f
     return interference_rise_coeff * active_users * noise_linear
 
 
-def sinr_threshold_linear(threshold_db: float) -> float:
-    """Convert the SINR service-continuity threshold from dB to linear."""
-    return 10 ** (threshold_db / 10)
-
-
 def compute_sinr(
     rx_power_dbm: float,
     active_users: int,
@@ -81,11 +81,3 @@ def sinr_to_db(sinr_linear: float) -> float:
     if sinr_linear <= 0:
         return float("-inf")
     return 10 * math.log10(sinr_linear)
-
-
-def service_continuity_ratio(sinr_observations: list[float], threshold_linear: float) -> float:
-    """ServiceContinuity = count(SINR >= threshold) / total observations."""
-    if not sinr_observations:
-        return 0.0
-    hits = sum(1 for s in sinr_observations if s >= threshold_linear)
-    return hits / len(sinr_observations)

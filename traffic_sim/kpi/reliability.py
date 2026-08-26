@@ -1,13 +1,22 @@
-"""Delivery reliability and service-continuity KPIs (Guide Section 11, 8.6)."""
+"""Delivery reliability and service-continuity KPIs (Guide Section 11).
+
+Service continuity is defined here, and ONLY here, as actual playback
+continuity:
+
+    SC = 1 - (total playback interruption time / total playback time)
+
+It is not a radio measure. SINR reaches it only through the delivery
+chain — SINR sets Shannon capacity, which sets the achievable delivery
+rate, which is compared against the segment's bitrate to fill or drain
+the UE buffer; an empty buffer is a playback stall, and stalls are what
+SC counts. A separate SINR-threshold continuity metric would double-count
+radio quality, so none exists. Raw radio quality is reported on its own
+as the `mean_sinr_db` KPI.
+"""
 
 from __future__ import annotations
 
-from traffic_sim.network.sinr import service_continuity_ratio
 from traffic_sim.simulation.user import UE
-
-# Re-exported: service continuity is defined in network.sinr since it is
-# fundamentally a radio-quality measure, but it is also a top-level KPI.
-service_continuity = service_continuity_ratio
 
 
 def successful_delivery_ratio(successful_deliveries: int, required_deliveries: int) -> float:
@@ -42,15 +51,16 @@ def observe_playback(ues: list[UE]) -> None:
         ue.is_stalled = stalled_now
 
 
-def playback_continuity(ues: list[UE]) -> float:
-    """Fraction of observed UE-ticks spent actually playing rather than stalled.
+def service_continuity(ues: list[UE]) -> float:
+    """SC = 1 - (total playback interruption time / total playback time).
 
-    This is the "actual playback/delivery continuity" half of the guide's
-    service-continuity KPI (Section 11); `service_continuity` above is the
-    SINR-threshold half. Both are reported.
+    Time is counted in UE-ticks: each UE contributes one tick of playback
+    time per observed tick, and one tick of interruption time for each
+    tick it spent stalled. Returns 1.0 when nothing has been observed yet
+    (no playback attempted means no interruption).
     """
-    total_ticks = sum(ue.playback_ticks for ue in ues)
-    if total_ticks <= 0:
+    total_playback_ticks = sum(ue.playback_ticks for ue in ues)
+    if total_playback_ticks <= 0:
         return 1.0
-    stalled = sum(ue.stall_ticks for ue in ues)
-    return 1.0 - (stalled / total_ticks)
+    interruption_ticks = sum(ue.stall_ticks for ue in ues)
+    return 1.0 - (interruption_ticks / total_playback_ticks)
