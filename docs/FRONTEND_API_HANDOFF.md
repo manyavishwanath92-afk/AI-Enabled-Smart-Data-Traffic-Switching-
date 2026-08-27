@@ -1,8 +1,37 @@
 # Frontend / API Handoff — AI-Enabled Smart Data Traffic Switching
 
-**Audience:** Manus (frontend/dashboard implementer). **Status:** this document is a **specification**, not a running system. Nothing in "Part 4 — REST API Contract" is implemented yet; it describes the contract a future API layer should expose over the existing, tested backend described in Parts 1–3. No frontend code, and no backend code beyond what earlier phases already validated (Phase 2A radio/delivery, the intelligence layer, MBOS/PCF), exists as a result of this document.
+**Audience:** Manus (frontend/dashboard implementer).
 
-Every field named below is cited to a real file/function/class in the repository. Nothing here is invented. Where something the dashboard would want isn't currently persisted anywhere queryable, that's called out explicitly as a gap rather than silently assumed.
+**Status: the API in Part 4 is implemented and ready to connect to.** Start it with `pip install -e '.[api]'` then `python -m traffic_sim.api`, and browse the live Swagger docs at `http://127.0.0.1:8000/docs`. It serves real data from real simulation runs — nothing is mocked. The WebSocket in Part 5 is implemented too. No frontend code exists yet; that is Manus's job, and Parts 3 and 6 are written to support it.
+
+Every field named below is cited to a real file/function/class in the repository. Nothing here is invented. Where a value is only available for the current tick rather than historically, that is stated plainly rather than glossed over.
+
+---
+
+## Quick Start (60 seconds)
+
+```bash
+pip install -e '.[api]'
+python -m traffic_sim.api            # http://127.0.0.1:8000  (Swagger: /docs)
+```
+
+```bash
+# 1. start a watchable AI run (0.2s per tick)
+curl -X POST http://127.0.0.1:8000/api/simulations \
+  -H 'Content-Type: application/json' \
+  -d '{"scenario":"flash_crowd","mode_selector":"ai","ticks":120,"seed":11,"tick_interval_s":0.2}'
+# -> {"simulation_id":"sim_abc123","status":"running", ...}
+
+# 2. watch it live over the WebSocket
+#    ws://127.0.0.1:8000/api/simulations/sim_abc123/live
+
+# 3. or read any snapshot over REST
+curl http://127.0.0.1:8000/api/simulations/sim_abc123/kpis/latest
+curl http://127.0.0.1:8000/api/simulations/sim_abc123/decisions/history?limit=20
+curl 'http://127.0.0.1:8000/api/comparison?scenario=flash_crowd&ticks=20&seeds=11&seeds=22'
+```
+
+Full endpoint reference in **Part 4**; live-update details in **Part 5**; what every field means and where it comes from in **Part 3**.
 
 ---
 
@@ -153,13 +182,15 @@ Every field: **name**, **meaning**, **unit**, **source**, **granularity**, **bac
 | `total_required_resource_mbps` | Total resource cost this tick under the active policy | Mbps | `KPIRecord.total_required_resource_mbps` | per-tick | Backend |
 | `resource_baseline_always_unicast_mbps` | What the same tick would have cost if every group had gone unicast | Mbps | `KPIRecord.resource_baseline_always_unicast_mbps` | per-tick | Backend |
 | `resource_savings_vs_baseline` | `1 − required/baseline` | 0–1 | `KPIRecord.resource_savings_vs_baseline` | per-tick or run-average | Backend |
-| **Per-group delivery detail** (mode, `n_requesting`, `required_resource_mbps`, `congestion`, `achievable_mbps_by_ue`) | The raw result of one group's delivery this tick | mixed | `traffic_sim/delivery/result.py :: DeliveryResult` | per-group, per-tick | Backend computes it; **not currently persisted** — see Gap note below |
+| **Per-group delivery detail** (mode, `n_requesting`, `required_resource_mbps`, `congestion`, `sinr_by_ue`, `achievable_mbps_by_ue`, `content_received_seconds_by_ue`, `delivered_ue_ids`) | The raw result of one group's delivery this tick | mixed | `traffic_sim/delivery/result.py :: DeliveryResult`, served by `GET /api/simulations/{id}/groups/latest` | per-group, per-tick | Backend |
 
-> **Gap:** `DeliveryResult` objects exist only transiently inside `Simulator.step()` (`traffic_sim/simulation/simulator.py`, the `delivery_results` list) — they are consumed by `KPIEngine.record_tick()` into the aggregate `KPIRecord` and then discarded. If the dashboard wants a live per-group breakdown (not just the tick-level aggregate `mode_breakdown` string), a future API layer needs to capture `delivery_results` per tick before it's dropped — e.g. keep the last N ticks in memory. This document flags it rather than inventing a field that doesn't exist yet.
+> **Current-tick only.** `DeliveryResult` objects are transient inside `Simulator.step()` — consumed by `KPIEngine.record_tick()` into the aggregate `KPIRecord`, then discarded. The API layer (`traffic_sim/api/runner.py`) captures them as they pass through `record_tick` and keeps **the latest tick only**, which is what `/groups/latest` serves. There is no per-group delivery *history*: for anything older than the current tick, use the tick-level aggregates in `KPIRecord` (`mode_breakdown`, `total_required_resource_mbps`, …) via `/kpis/history`. If a historical per-group breakdown is ever needed, the capture buffer in `SimulationRunner` is where it would be widened.
 
 ### 3.4 AI Decision / Explainability
 
-All from `traffic_sim/ai/agent.py :: AIDecision`, one per (cell, segment) group, per tick — produced by `AIAgent.decide()`. The *live, full-detail* view (including `reason.winning_terms`) is still transient — captured today via `AIAgent.current_tick_stats().decisions`, valid only between the end of a tick's decisions and the next `observe()` call, so it can only be shown for the tick currently in flight, not looked up after the fact. **A persisted, dashboard-sized subset of these same fields across recent ticks is now available — see 3.7 (`AIAgent.decision_history()`) — that gap is resolved for the switching-history use case.** The full nested `reason` dict (explainability detail) and raw per-UE `DeliveryResult` (3.3/3.5) remain live-only; see the Gap notes there.
+All from `traffic_sim/ai/agent.py :: AIDecision`, one per (cell, segment) group, per tick — produced by `AIAgent.decide()`, served by `GET /api/simulations/{id}/decisions/latest`.
+
+Inside the simulator these objects are transient (cleared by `AIAgent.observe()` at the end of every tick), so the API captures them as they pass through `KPIEngine.record_tick` and retains **the latest tick only**. That is enough for a live explainability panel — "why did the AI just do that?" — but there is no full-detail decision *history*. For decisions across ticks, use the persisted, dashboard-sized `DecisionRecord` rows in 3.7 (`/decisions/history`), which cover the final mode and its headline reasoning but not the nested `reason.winning_terms` breakdown.
 
 | Field | Meaning | Unit | Backend/Frontend |
 |---|---|---|---|
@@ -206,7 +237,8 @@ All from `traffic_sim/ai/agent.py :: AIDecision`, one per (cell, segment) group,
 | `mean_sinr_db` | Average signal quality UEs actually experienced | dB | `KPIRecord.mean_sinr_db` (via `network/sinr.py :: sinr_to_db`) | per-tick or run-average | Backend |
 | `sinr_linear` | Per-UE SINR (linear) | ratio | `UE.sinr_linear` | per-UE, per-tick | Backend |
 | `mean_achievable_mbps` | Average actual delivery rate achieved | Mbps | `KPIRecord.mean_achievable_mbps` | per-tick or run-average | Backend |
-| `achievable_mbps_by_ue` | Per-UE achievable rate for this delivery | Mbps | `DeliveryResult.achievable_mbps_by_ue` | per-UE, per-group, per-tick | Backend computes it; same persistence gap as 3.3 |
+| `achievable_mbps_by_ue` | Per-UE achievable rate for this delivery | Mbps | `DeliveryResult.achievable_mbps_by_ue`, via `/groups/latest` | per-UE, per-group, per-tick | Backend (current tick only — see 3.3) |
+| `sinr_by_ue` | Per-UE SINR for this delivery | ratio | `DeliveryResult.sinr_by_ue`, via `/groups/latest` | per-UE, per-group, per-tick | Backend (current tick only — see 3.3) |
 
 > Raw Shannon capacity (bits/s theoretical ceiling) is computed transiently inside `traffic_sim/network/radio.py :: compute_ue_radio_state()` (`RadioState.shannon_mbps`) during feature extraction and delivery, but is not stored anywhere after that tick. If the dashboard wants to show "theoretical ceiling vs. achieved," that's a small backend addition (persist `RadioState` alongside the UE/DeliveryResult for the tick), not something to fake on the frontend.
 
@@ -268,9 +300,47 @@ From `traffic_sim/experiments/compare.py :: run_comparison()` — runs `always-u
 
 ---
 
-## Part 4 — REST API Contract (Specification)
+## Part 4 — REST API (Implemented)
 
-**This is a proposed contract for a future implementation — no server exists yet.** Endpoints return JSON built directly from the dataclasses cited in Part 3 (most already support `dataclasses.asdict()`-style serialization, as `KPIEngine.to_records()` demonstrates). Nothing here requires the frontend to compute a KPI itself.
+**This API is implemented and running-ready** — `traffic_sim/api/` (FastAPI), covered by `tests/test_api.py`. Endpoints return JSON built directly from the dataclasses cited in Part 3. Nothing here requires the frontend to compute a KPI itself.
+
+### Running it
+
+```bash
+pip install -e '.[api]'        # fastapi + uvicorn (optional extra)
+python -m traffic_sim.api      # -> http://127.0.0.1:8000
+```
+
+Flags: `--host`, `--port`, `--reload`. Interactive Swagger docs are auto-generated at **`http://127.0.0.1:8000/docs`** — the fastest way to explore every endpoint and see live response shapes without writing a line of frontend code.
+
+**CORS is wide open** (`allow_origins=["*"]`), so a dashboard served from any origin/port can call this directly in development. That is deliberate for a local PoC serving simulated data and holding no credentials; a deployed instance should name its allowed origins instead.
+
+### How it relates to the simulator
+
+The API never re-implements simulation logic. It builds simulators through the existing `traffic_sim.main.build_simulator()` seam and advances them one `Simulator.step()` at a time on a background thread, which is what makes a run observable while it is still in flight. A parity test (`test_api_run_matches_a_direct_simulator_run_exactly`) asserts that the same seed/scenario/tick-count through the API produces KPIs identical to a direct `build_simulator(...).run(...)`, so the serving layer provably observes without perturbing.
+
+### Endpoint summary
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/health` | Liveness check |
+| `GET /api/config` | Every `SimConfig` field |
+| `GET /api/scenarios` | Valid `scenario` / `mode_selector` values and limits |
+| `POST /api/simulations` | Start a run |
+| `GET /api/simulations` | List all runs held by the server |
+| `GET /api/simulations/{id}/status` | Progress and lifecycle state |
+| `POST /api/simulations/{id}/stop` | Halt a run early |
+| `DELETE /api/simulations/{id}` | Discard a run |
+| `GET /api/simulations/{id}/kpis/latest` | Newest `KPIRecord` |
+| `GET /api/simulations/{id}/kpis/history` | All `KPIRecord`s (tick-range filterable) |
+| `GET /api/simulations/{id}/kpis/summary` | Run-averaged aggregates |
+| `GET /api/simulations/{id}/cells` | Live cell state |
+| `GET /api/simulations/{id}/ues` | Live UE state (paginated, cell-filterable) |
+| `GET /api/simulations/{id}/groups/latest` | Per-group delivery detail, current tick |
+| `GET /api/simulations/{id}/decisions/latest` | Full-detail AI decisions, current tick |
+| `GET /api/simulations/{id}/decisions/history` | Persisted switching history |
+| `GET /api/comparison` | AI-vs-baseline table |
+| `WS /api/simulations/{id}/live` | One push message per tick |
 
 ### `GET /api/config`
 Returns the active `SimConfig` (`SimConfig.to_dict()` — already implemented, just needs to be served).
@@ -286,16 +356,35 @@ Returns the active `SimConfig` (`SimConfig.to_dict()` — already implemented, j
 ```
 
 ### `POST /api/simulations`
-Start a run. Body:
+Start a run (HTTP 201). Body — every field optional, defaults shown:
 ```json
-{ "scenario": "flash_crowd", "mode_selector": "ai", "ticks": 300, "seed": 11 }
+{
+  "scenario": "flash_crowd", "mode_selector": "ai", "ticks": 120, "seed": null,
+  "tick_interval_s": 0.0, "config_overrides": null
+}
 ```
-`scenario` ∈ `{"uniform", "flash_crowd"}`; `mode_selector` ∈ `traffic_sim/simulation/mode_selectors.py::SELECTOR_FACTORY` keys (`"always-unicast"`, `"always-broadcast"`, `"random"`, `"rule-by-group-size"`, `"ai"`). Response: `{ "simulation_id": "sim_abc123", "status": "running" }`.
+- `scenario` ∈ `{"uniform", "flash_crowd"}`; `mode_selector` ∈ `SELECTOR_FACTORY` keys (`"always-unicast"`, `"always-broadcast"`, `"random"`, `"rule-by-group-size"`, `"ai"`). Fetch both lists from `/api/scenarios` rather than hardcoding them.
+- **`tick_interval_s`** (added beyond the original spec) — seconds to pause between ticks. `0.0` runs flat out, best when you just want a finished run to chart. `0.1`–`0.5` makes the run *watchable*: use it for the live "watch the AI adapt" view.
+- **`config_overrides`** (added beyond the original spec) — any `SimConfig` field, e.g. `{"broadcast_cell_capacity_mbps": 4.0}` to demo a starved broadcast carrier. Validated by `SimConfig` itself; unknown fields or invalid values return 400.
+
+Response is the same shape as `/status` below. Invalid selector/scenario/override → 400; out-of-range `ticks`/`tick_interval_s` → 422.
+
+### `GET /api/simulations` (added beyond the original spec)
+List of every run the server currently holds, each in the `/status` shape.
 
 ### `GET /api/simulations/{id}/status`
 ```json
-{ "simulation_id": "sim_abc123", "status": "running", "current_tick": 142, "total_ticks": 300 }
+{
+  "simulation_id": "sim_abc123", "status": "running",
+  "current_tick": 142, "total_ticks": 300,
+  "scenario": "flash_crowd", "mode_selector": "ai",
+  "tick_interval_s": 0.1, "seed": 11, "error": null
+}
 ```
+`status` ∈ `pending | running | completed | stopped | failed`. On `failed`, `error` carries the exception text.
+
+### `POST /api/simulations/{id}/stop` · `DELETE /api/simulations/{id}` (added beyond the original spec)
+Halt a run early (returns the final `/status` payload, `status: "stopped"`), or discard it entirely (`{"simulation_id": ..., "deleted": true}`).
 
 ### `GET /api/simulations/{id}/kpis/latest`
 The most recent `KPIRecord`, `dataclasses.asdict()`-serialized (field list: Part 3.1/3.3/3.5/3.6/3.7).
@@ -315,13 +404,19 @@ List of `KPIRecord` (i.e. `KPIEngine.to_records()`), for building timeline chart
 `KPIEngine.summary()` verbatim — the run-averaged aggregates used throughout Part 3.
 
 ### `GET /api/simulations/{id}/cells`
-List of current `Cell` states (Part 3.2), each including the computed `congestion`.
+List of current `Cell` states (Part 3.2), each including the computed `congestion` (a method on `Cell`, not a stored field) plus `num_connected_ues`.
 
 ### `GET /api/simulations/{id}/ues?cell_id=&limit=&offset=`
-Paginated list of current `UE` states (Part 3.2) — with ~100 UEs, pagination keeps payloads small; `cell_id` narrows to one cell for the UE-map view.
+Paginated list of current `UE` states (Part 3.2); `cell_id` narrows to one cell for the UE-map view. **Differs from the original proposal:** returns an envelope, not a bare array, so the frontend can page without a second count request. `limit` defaults to 200 (max 1000). All enum fields arrive as plain strings (`"unicast"`, `"good"`, …).
+```json
+{ "total": 100, "limit": 200, "offset": 0, "items": [ { "ue_id": "ue_0", "...": "..." } ] }
+```
+
+### `GET /api/simulations/{id}/groups/latest` (added beyond the original spec)
+Per-group `DeliveryResult`s for the most recent tick (Part 3.3) — the per-group unicast/broadcast breakdown behind the aggregate `mode_breakdown` string. Current tick only.
 
 ### `GET /api/simulations/{id}/decisions/latest`
-List of this tick's full-detail `AIDecision` objects (Part 3.4) — **only meaningful when `mode_selector == "ai"`**; empty list for fixed-rule policies. Live-tick-only: this is the one still-open gap (capturing `AIAgent.current_tick_stats().decisions` per tick instead of discarding it), needed only if the dashboard wants the full explainability detail (`reason.winning_terms`, etc.) for the tick currently in flight. For historical switching, use `/decisions/history` below instead — that gap is already resolved.
+This tick's full-detail `AIDecision` objects (Part 3.4), nested `reason` included — the explainability panel's data source. **Only populated when `mode_selector == "ai"`**; `[]` for fixed-rule policies, which make no explainable decision. Current tick only (see 3.4); for decisions across ticks use `/decisions/history` below.
 ```json
 [
   {
@@ -367,15 +462,49 @@ Runs `run_comparison()` (Part 3.8) and returns the per-policy rows.
   { "policy": "ai", "summary": { "resource_savings_vs_baseline": 0.74, "service_continuity": 0.87, "...": "..." } }
 ]
 ```
-Note: this is a batch computation (up to 4 policies × several seeds × N ticks run synchronously) — see the transport recommendation below for why this endpoint is polled, not streamed.
+**Differs from the original proposal:** implemented as a single **synchronous** request rather than the POST-then-poll job pattern Part 5 originally suggested — measured at well under a second for `ticks=20, seeds=11&seeds=22`, which does not justify job-tracking machinery. Pass `seeds` as a repeated query parameter (`?seeds=11&seeds=22`); defaults are `scenario=flash_crowd`, `ticks=60`, `seeds=[11,22,33]`. It is CPU-bound (4 policies × N seeds × full simulations), so keep `ticks` modest (capped at 500) and show a spinner rather than blocking the whole dashboard on it.
 
 ---
 
-## Part 5 — Live Update Transport Recommendation
+## Part 5 — Live Updates (Implemented)
 
-**For a running single simulation (Sections 1–7 of the dashboard):** use a **WebSocket** (or Server-Sent Events, if the eventual backend framework makes that simpler) that pushes one message per tick — `{ "kpi": <KPIRecord>, "decisions": [<AIDecision>...] }` — while a simulation with `mode_selector=ai` is running. Ticks are cheap (the AI inference latency measured live is well under a millisecond per group; a full tick is a handful of milliseconds), so a 300-tick run can push tens of updates per second — a natural fit for a persistent stream rather than the frontend re-polling a REST endpoint every few milliseconds. Fall back to **REST polling** of `/kpis/latest` (2–5× per second) for a first cut or if a WebSocket layer isn't available yet — perfectly usable, just less smooth for the closed-loop "watch it adapt" narrative the dashboard should tell.
+### `WS /api/simulations/{id}/live`
 
-**For `/api/comparison` (Section 8):** plain **REST polling** of a job-status pattern (`POST` to start, `GET .../status` every second or two until `"status": "done"`) is the right fit — it's a short, one-shot batch computation (a handful of seconds), not a continuous stream, and doesn't need socket infrastructure.
+**The WebSocket is implemented.** Connect after starting a run (use a non-zero `tick_interval_s` so there is something to watch), and the server pushes **one message per simulated tick**:
+
+```json
+{
+  "type": "tick",
+  "simulation_id": "sim_abc123",
+  "tick": 42,
+  "kpi": { "tick": 42, "sim_time_s": 42.0, "mode_breakdown": "broadcast=13,unicast=4", "...": "...(all KPIRecord fields)" },
+  "decisions": [ { "mode": "broadcast", "reason": { "...": "..." }, "...": "..." } ],
+  "groups":    [ { "mode": "broadcast", "n_requesting": 12, "...": "..." } ]
+}
+```
+
+One message carries everything the live view needs — the tick's KPIs (Sections 1, 3, 5, 6, 7), its AI decisions with full `reason` detail (Section 4), and its per-group delivery breakdown (Section 3) — so a live dashboard needs **no REST polling at all** while a run is in flight.
+
+Behaviour worth knowing:
+- On connect, the **current tick is replayed immediately**, so a client joining mid-run renders at once instead of waiting for the next tick.
+- Every tick is delivered in order; none are dropped or coalesced.
+- When the run finishes the server sends a final `{"type": "status", ...}` message (the `/status` payload, e.g. `"status": "completed"`) and closes.
+- An unknown `simulation_id` yields `{"type": "error", "detail": "..."}` then a close.
+- `decisions` is `[]` for fixed-rule policies — the stream shape is identical across policies, so the same client code handles baselines and the AI.
+
+Example:
+```js
+const ws = new WebSocket(`ws://127.0.0.1:8000/api/simulations/${simId}/live`);
+ws.onmessage = (e) => {
+  const msg = JSON.parse(e.data);
+  if (msg.type === "tick") updateDashboard(msg.kpi, msg.decisions, msg.groups);
+  else if (msg.type === "status") markRunFinished(msg.status);
+};
+```
+
+**REST polling remains a valid fallback** — `GET /kpis/latest` a few times a second gives the same numbers, just less smoothly. Use it for a first cut, or if the frontend framework makes sockets awkward.
+
+**For `/api/comparison` (Section 8):** plain request/response — it is a synchronous endpoint (see Part 4), fast enough at modest `ticks` that no job-polling pattern is needed.
 
 ---
 
