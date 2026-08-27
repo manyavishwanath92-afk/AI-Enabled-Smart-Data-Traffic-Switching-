@@ -87,6 +87,113 @@ def test_baselines_never_touch_mbos_or_pcf():
     assert simulator.mode_selector is always_broadcast
     assert not hasattr(simulator.mode_selector, "mbos")
     assert not hasattr(simulator.mode_selector, "pcf")
+    assert not hasattr(simulator.mode_selector, "decision_history")
+
+
+# --- decision history (dashboard/API telemetry) -----------------------------
+
+
+def _agent_and_group(**overrides):
+    from traffic_sim.ai.agent import AIAgent
+    from traffic_sim.simulation.cell import Cell
+    from traffic_sim.simulation.user import UE
+
+    cfg = SimConfig.default().with_overrides(**overrides) if overrides else SimConfig.default()
+    agent = AIAgent(cfg)
+    cell = Cell(cell_id="c0", center_x_km=0, center_y_km=0, maximum_capacity_mbps=100.0)
+    ues = [UE(ue_id="u0", x_km=0.1, y_km=0.0, cell_id="c0", buffer_seconds=10.0)]
+    return cfg, agent, cell, ues
+
+
+def test_decision_history_selected_mode_is_final_after_pcf_reverts():
+    """The history must record what PCF actually allowed, not the agent's
+    pre-PCF candidate - proven by forcing PCF to revert a decision and
+    checking the persisted DecisionRecord reflects the reversion."""
+    from types import SimpleNamespace
+
+    from traffic_sim.policy.pcf import PRIORITY_BUFFER_MARGIN, PolicyEvaluation
+    from traffic_sim.simulation.user import DeliveryMode
+
+    cfg, agent, cell, ues = _agent_and_group()
+
+    def fake_enforce(mode, current_mode, service_priority, buffer_min_s, confidence):
+        # Whatever MBOS proposed, PCF reverts it to UNICAST.
+        return PolicyEvaluation(
+            final_mode=DeliveryMode.UNICAST, compliant=False, violated_rules=[PRIORITY_BUFFER_MARGIN]
+        )
+
+    agent.pcf.enforce = fake_enforce
+    decision = agent.decide("seg_0", ues, cell, cfg)
+    assert decision.mode == DeliveryMode.UNICAST  # AIDecision itself already reconciled
+
+    agent.observe([cell], [], SimpleNamespace(tick=1, sim_time_s=1.0))
+    history = agent.decision_history()
+
+    assert len(history) == 1
+    assert history[0].selected_mode == "unicast"
+    assert history[0].pcf_result == f"reverted:{PRIORITY_BUFFER_MARGIN}"
+
+
+def test_decision_history_previous_mode_matches_prior_selected_mode():
+    """Across two ticks for the same group, the second row's previous_mode
+    must equal the first row's selected_mode - proving continuity is
+    tracked correctly regardless of which mode was actually chosen."""
+    from types import SimpleNamespace
+
+    cfg, agent, cell, ues = _agent_and_group()
+
+    for tick in (1, 2):
+        agent.decide("seg_0", ues, cell, cfg)
+        agent.observe([cell], [], SimpleNamespace(tick=tick, sim_time_s=tick * cfg.simulation_timestep_s))
+
+    history = agent.decision_history()
+    assert len(history) == 2
+    assert history[0].previous_mode is None  # first-ever decision for this group
+    assert history[1].previous_mode == history[0].selected_mode
+
+
+def test_decision_history_mbos_bearer_and_pcf_result_reflect_final_mode():
+    from types import SimpleNamespace
+
+    from traffic_sim.mbos.controller import bearer_for
+    from traffic_sim.simulation.user import DeliveryMode
+
+    cfg, agent, cell, ues = _agent_and_group()
+    agent.decide("seg_0", ues, cell, cfg)
+    agent.observe([cell], [], SimpleNamespace(tick=1, sim_time_s=1.0))
+
+    record = agent.decision_history()[0]
+    assert record.mbos_bearer == bearer_for(DeliveryMode(record.selected_mode))
+    assert record.pcf_result == "compliant"  # nothing forces a violation in this scenario
+
+
+def test_decision_history_is_bounded_to_the_most_recent_records():
+    from types import SimpleNamespace
+
+    cfg, agent, cell, ues = _agent_and_group(decision_history_size=3)
+
+    for tick in range(1, 8):  # far more ticks than the configured cap
+        agent.decide("seg_0", ues, cell, cfg)
+        agent.observe([cell], [], SimpleNamespace(tick=tick, sim_time_s=float(tick)))
+
+    history = agent.decision_history()
+    assert len(history) == 3
+    assert [r.tick for r in history] == [5, 6, 7]  # oldest dropped, newest kept
+
+
+def test_decision_history_populated_by_a_real_simulator_run():
+    """End-to-end: a real simulator run must leave decision_history
+    populated and survivable past the run, unlike current_tick_stats()
+    which is cleared by the final tick's observe()."""
+    simulator = run_ai(ticks=15)
+    history = simulator.mode_selector.decision_history()
+
+    assert len(history) > 0
+    kpi_ticks = {r["tick"] for r in simulator.kpi_engine.to_records()}
+    assert {r.tick for r in history} <= kpi_ticks
+    for r in history:
+        assert r.selected_mode in ("unicast", "broadcast")
+        assert r.mbos_bearer in ("cellular", "broadcast")
 
 
 def test_switch_count_and_inference_latency_are_no_longer_placeholders():

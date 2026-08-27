@@ -60,6 +60,7 @@ unpoliced, "raw" comparison points for `traffic_sim.experiments.compare`.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 
 from config.config import SimConfig
@@ -81,6 +82,8 @@ class AIDecision:
     mode: DeliveryMode
     confidence: float
     reason: dict[str, object]
+    cell_id: str
+    segment_id: str
     utility_unicast: float
     utility_broadcast: float
     predicted_unicast_mbps: float
@@ -88,6 +91,11 @@ class AIDecision:
     prediction_source: str
     inference_latency_ms: float
     switched: bool
+    # The mode this group was in immediately before this decision (None on
+    # a group's very first decision). Carried out here because it can't be
+    # reconstructed afterward — `_GroupState.current_mode` is overwritten
+    # with the new final mode by the time this decision returns.
+    previous_mode: DeliveryMode | None
     # MBOS — session/bearer coordination (traffic_sim.mbos.controller).
     session_id: str
     target_bearer: str
@@ -116,6 +124,34 @@ class TickStats:
     decisions: list[AIDecision] = field(default_factory=list)
 
 
+@dataclass
+class DecisionRecord:
+    """One dashboard-friendly, persisted row of decision history.
+
+    Deliberately lighter than `AIDecision`: plain JSON-serialisable values
+    (modes as their `.value` strings, not enums), no nested `reason` dict,
+    no `DeliveryResult`. `selected_mode`/`mbos_bearer` are read straight off
+    the already-reconciled post-MBOS-post-PCF `AIDecision` fields, so this
+    is guaranteed to reflect the FINAL delivered mode, never the agent's
+    pre-PCF candidate.
+    """
+
+    tick: int
+    sim_time_s: float
+    cell_id: str
+    group_id: str  # segment id
+    previous_mode: str | None
+    selected_mode: str
+    utility_unicast: float
+    utility_broadcast: float
+    broadcast_benefit: float
+    confidence: float
+    decision_reason: str
+    mbos_bearer: str
+    pcf_result: str
+    inference_latency_ms: float
+
+
 class AIAgent:
     def __init__(
         self,
@@ -133,6 +169,10 @@ class AIAgent:
         self._prev_broadcast_groups: dict[str, int] = {}
         self._sim_time_s = 0.0
         self._tick_decisions: list[AIDecision] = []
+        # Bounded, dashboard-friendly decision history — see DecisionRecord.
+        # Populated in observe() (which has the tick's real KPIRecord),
+        # never grows past decision_history_size.
+        self._decision_history: deque[DecisionRecord] = deque(maxlen=config.decision_history_size)
         # Populated by prepare_tick(); looked up by decide(). Empty when
         # prepare_tick() was not called this tick, in which case decide()
         # falls back to computing everything for itself (see decide()).
@@ -343,6 +383,8 @@ class AIAgent:
             mode=final,
             confidence=confidence,
             reason=reason,
+            cell_id=key[0],
+            segment_id=key[1],
             utility_unicast=u_unicast.total,
             utility_broadcast=u_broadcast.total,
             predicted_unicast_mbps=plan.outcomes.unicast.achievable_mbps,
@@ -350,6 +392,7 @@ class AIAgent:
             prediction_source=prediction_source,
             inference_latency_ms=inference_latency_ms,
             switched=switched,
+            previous_mode=current,
             session_id=mbos_result.session_id,
             target_bearer=reported_bearer,
             handover=reported_handover,
@@ -428,6 +471,16 @@ class AIAgent:
             decisions=list(self._tick_decisions),
         )
 
+    def decision_history(self, limit: int | None = None) -> list[DecisionRecord]:
+        """Recent decision rows for a dashboard/API layer.
+
+        Unlike `current_tick_stats().decisions`, this survives past the end
+        of a run — it's populated in `observe()` each tick and bounded to
+        `config.decision_history_size` rows (oldest dropped first).
+        """
+        records = list(self._decision_history)
+        return records[-limit:] if limit else records
+
     def observe(self, cells, delivery_results, record) -> None:
         """Closed-loop feedback, called by the Simulator after each tick.
 
@@ -455,6 +508,35 @@ class AIAgent:
             if result.mode == "broadcast":
                 broadcast_counts[result.cell_id] = broadcast_counts.get(result.cell_id, 0) + 1
         self._prev_broadcast_groups = broadcast_counts
+
+        # Turn this tick's decisions into bounded, dashboard-friendly
+        # history rows before they're cleared below. `record` (this tick's
+        # real KPIRecord) is only available here, not inside decide() —
+        # that's why history is built in observe(), not decide().
+        for decision in self._tick_decisions:
+            pcf_result = (
+                "compliant"
+                if decision.pcf_compliant
+                else "reverted:" + ",".join(decision.pcf_violated_rules)
+            )
+            self._decision_history.append(
+                DecisionRecord(
+                    tick=record.tick,
+                    sim_time_s=record.sim_time_s,
+                    cell_id=decision.cell_id,
+                    group_id=decision.segment_id,
+                    previous_mode=decision.previous_mode.value if decision.previous_mode else None,
+                    selected_mode=decision.mode.value,
+                    utility_unicast=decision.utility_unicast,
+                    utility_broadcast=decision.utility_broadcast,
+                    broadcast_benefit=decision.reason.get("broadcast_benefit", 0.0),
+                    confidence=decision.confidence,
+                    decision_reason=decision.reason.get("action", ""),
+                    mbos_bearer=decision.target_bearer,
+                    pcf_result=pcf_result,
+                    inference_latency_ms=decision.inference_latency_ms,
+                )
+            )
 
         self._tick_decisions = []
         # Belt-and-braces: prepare_tick() already resets these at the start

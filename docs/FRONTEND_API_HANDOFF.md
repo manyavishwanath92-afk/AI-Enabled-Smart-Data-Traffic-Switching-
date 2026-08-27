@@ -159,11 +159,14 @@ Every field: **name**, **meaning**, **unit**, **source**, **granularity**, **bac
 
 ### 3.4 AI Decision / Explainability
 
-All from `traffic_sim/ai/agent.py :: AIDecision`, one per (cell, segment) group, per tick — produced by `AIAgent.decide()`. Also transient (see the same Gap pattern as 3.3): captured today via `AIAgent.current_tick_stats().decisions`, valid only between the end of a tick's decisions and the next `observe()` call.
+All from `traffic_sim/ai/agent.py :: AIDecision`, one per (cell, segment) group, per tick — produced by `AIAgent.decide()`. The *live, full-detail* view (including `reason.winning_terms`) is still transient — captured today via `AIAgent.current_tick_stats().decisions`, valid only between the end of a tick's decisions and the next `observe()` call, so it can only be shown for the tick currently in flight, not looked up after the fact. **A persisted, dashboard-sized subset of these same fields across recent ticks is now available — see 3.7 (`AIAgent.decision_history()`) — that gap is resolved for the switching-history use case.** The full nested `reason` dict (explainability detail) and raw per-UE `DeliveryResult` (3.3/3.5) remain live-only; see the Gap notes there.
 
 | Field | Meaning | Unit | Backend/Frontend |
 |---|---|---|---|
-| `mode` | Final decided mode | enum | Backend |
+| `mode` | Final decided mode, after MBOS + PCF | enum | Backend |
+| `cell_id` | Which cell this decision belongs to | string | Backend |
+| `segment_id` | Which content segment/group this decision belongs to | string | Backend |
+| `previous_mode` | The mode this group was in immediately before this decision (`null` on its first-ever decision) | enum or null | Backend |
 | `confidence` | How decisively the utility scores favoured this mode (0 = tied, 1 = ≥0.25 apart) | 0–1 | Backend |
 | `reason.candidate` | What the cell-coordinated ranking proposed before safety gates | string | Backend |
 | `reason.utility_gap` | `|U_broadcast − U_unicast|` | utility units | Backend |
@@ -224,15 +227,34 @@ All from `traffic_sim/ai/agent.py :: AIDecision`, one per (cell, segment) group,
 
 ### 3.7 AI Switching History
 
+**Tick-level aggregate (from `KPIRecord`, every tick, any policy):**
+
 | Field | Meaning | Unit | Source | Granularity | Backend/Frontend |
 |---|---|---|---|---|---|
 | `switch_count` | Groups that changed mode this tick | count | `KPIRecord.switch_count` (populated only when the policy is `ai`) | per-tick | Backend |
 | `total_switches` | Sum across the run | count | `KPIEngine.summary()["total_switches"]` | run-total | Backend |
 | `ai_inference_latency_ms` | Mean per-group inference time this tick | ms | `KPIRecord.ai_inference_latency_ms` | per-tick | Backend |
 | `mean_inference_latency_ms` | Run-average of the above | ms | `KPIEngine.summary()["mean_inference_latency_ms"]` | run-average | Backend |
-| `AIDecision.switched` | Did *this specific group* switch this tick | bool | `traffic_sim/ai/agent.py` | per-group, per-tick | Backend |
-| `AIDecision.handover` | Did the bearer actually change (MBOS-confirmed) | bool | same | per-group, per-tick | Backend |
-| Switch timeline (a sequence like `U → U → B → B → U`) | Built by plotting `mode_breakdown` (3.1) or per-group `mode`/`switched` across consecutive `KPIRecord`s/`AIDecision`s over time | — | Derived by the frontend **purely by plotting backend-provided per-tick values in sequence** — no new computation, just charting | timeseries | Backend supplies each point; frontend arranges them on a timeline |
+
+**Per-group decision history — now persisted** (`traffic_sim/ai/agent.py :: DecisionRecord`, produced by `AIAgent.decision_history(limit=None)`; only present when the policy is `ai`). Unlike the live-only `AIDecision`/`current_tick_stats()` view in 3.4, this is a bounded, in-memory rolling window (newest `config.decision_history_size` rows, default 500, oldest dropped first) that survives past the tick it was recorded on — populated once per tick inside `AIAgent.observe()`, after that tick's real `tick`/`sim_time_s` are known. `selected_mode` and `mbos_bearer` are read from the already-reconciled, **post-MBOS-post-PCF** `AIDecision` fields, so this is guaranteed to be the mode that was actually delivered, never the agent's pre-PCF candidate:
+
+| Field | Meaning | Unit | Source | Granularity | Backend/Frontend |
+|---|---|---|---|---|---|
+| `tick` | Which tick this decision was made on | int | `DecisionRecord.tick` (= that tick's `KPIRecord.tick`) | per-group, per-tick | Backend |
+| `sim_time_s` | Simulated clock time of that tick | seconds | `DecisionRecord.sim_time_s` | per-group, per-tick | Backend |
+| `cell_id` | Which cell | string | `DecisionRecord.cell_id` | per-group, per-tick | Backend |
+| `group_id` | Which content segment/group (the `(cell_id, group_id)` pair is the group key used throughout the AI layer) | string | `DecisionRecord.group_id` | per-group, per-tick | Backend |
+| `previous_mode` | The mode this group was in immediately before this decision | `"unicast"` / `"broadcast"` / `null` | `DecisionRecord.previous_mode` | per-group, per-tick | Backend |
+| `selected_mode` | The FINAL mode, after MBOS coordination and PCF policy enforcement | `"unicast"` / `"broadcast"` | `DecisionRecord.selected_mode` | per-group, per-tick | Backend |
+| `utility_unicast`, `utility_broadcast` | Total utility score computed for each mode this tick | float | `DecisionRecord.utility_unicast` / `utility_broadcast` | per-group, per-tick | Backend |
+| `broadcast_benefit` | `max(0, utility_broadcast − utility_unicast)` — the cell-controller's ranking score | float | `DecisionRecord.broadcast_benefit` | per-group, per-tick | Backend |
+| `confidence` | How decisively the utility scores favoured `selected_mode`'s pre-PCF candidate | 0–1 | `DecisionRecord.confidence` | per-group, per-tick | Backend |
+| `decision_reason` | Which safety/policy outcome fired: `initial_assignment`, `hold_already_optimal`, `switch`, `hold_buffer_unsafe`, `hold_low_confidence`, `hold_within_hysteresis`, `hold_cooldown`, `switch_escape_stall`, `hold_pcf_policy_violation` | string (enum-like) | `DecisionRecord.decision_reason` | per-group, per-tick | Backend |
+| `mbos_bearer` | The physical bearer actually used: `"cellular"` or `"broadcast"` | string | `DecisionRecord.mbos_bearer` | per-group, per-tick | Backend |
+| `pcf_result` | `"compliant"`, or `"reverted:<rule_name>[,<rule_name>...]"` when PCF overrode the mode | string | `DecisionRecord.pcf_result` | per-group, per-tick | Backend |
+| `inference_latency_ms` | How long this one group's prediction took | ms | `DecisionRecord.inference_latency_ms` | per-group, per-tick | Backend |
+
+Switch timeline (a sequence like `U → U → B → B → U`), per group or per cell: build it by plotting consecutive `decision_history()` rows' `selected_mode` in `tick` order — no new computation on the frontend, just charting backend-provided values in sequence.
 
 ### 3.8 AI vs. Baseline Comparison
 
@@ -299,11 +321,12 @@ List of current `Cell` states (Part 3.2), each including the computed `congestio
 Paginated list of current `UE` states (Part 3.2) — with ~100 UEs, pagination keeps payloads small; `cell_id` narrows to one cell for the UE-map view.
 
 ### `GET /api/simulations/{id}/decisions/latest`
-List of this tick's `AIDecision` objects (Part 3.4) — **only meaningful when `mode_selector == "ai"`**; empty list for fixed-rule policies. *(Requires the small backend addition noted under 3.3/3.4 — capturing `AIAgent.current_tick_stats().decisions` per tick instead of discarding it.)*
+List of this tick's full-detail `AIDecision` objects (Part 3.4) — **only meaningful when `mode_selector == "ai"`**; empty list for fixed-rule policies. Live-tick-only: this is the one still-open gap (capturing `AIAgent.current_tick_stats().decisions` per tick instead of discarding it), needed only if the dashboard wants the full explainability detail (`reason.winning_terms`, etc.) for the tick currently in flight. For historical switching, use `/decisions/history` below instead — that gap is already resolved.
 ```json
 [
   {
     "mode": "broadcast", "confidence": 0.83,
+    "cell_id": "cell_0", "segment_id": "seg_2", "previous_mode": "unicast",
     "reason": {
       "candidate": "broadcast", "utility_gap": 0.21, "broadcast_benefit": 0.21,
       "winning_terms": {"quality": 1.0, "resource": 0.9, "buffer": 0.8, "popularity": 0.75, "mobility": 0.0, "switch": 0.0},
@@ -316,6 +339,20 @@ List of this tick's `AIDecision` objects (Part 3.4) — **only meaningful when `
     "prediction_source": "xgboost", "inference_latency_ms": 0.68, "switched": true,
     "session_id": "cell_0:seg_2", "target_bearer": "broadcast", "handover": true,
     "pcf_compliant": true, "pcf_violated_rules": []
+  }
+]
+```
+
+### `GET /api/simulations/{id}/decisions/history?limit=`
+The persisted per-group decision history (Part 3.7) — `AIAgent.decision_history(limit)`, already bounded server-side to `config.decision_history_size` rows; `limit` trims further for a smaller payload. `selected_mode` is always the final, post-MBOS-post-PCF mode. **Only meaningful when `mode_selector == "ai"`**; empty list for fixed-rule policies (they never populate this history — see 3.7).
+```json
+[
+  {
+    "tick": 20, "sim_time_s": 20.0, "cell_id": "cell_1", "group_id": "seg_2",
+    "previous_mode": "unicast", "selected_mode": "unicast",
+    "utility_unicast": 0.547, "utility_broadcast": 0.731, "broadcast_benefit": 0.183,
+    "confidence": 0.734, "decision_reason": "hold_cooldown",
+    "mbos_bearer": "cellular", "pcf_result": "compliant", "inference_latency_ms": 0.80
   }
 ]
 ```

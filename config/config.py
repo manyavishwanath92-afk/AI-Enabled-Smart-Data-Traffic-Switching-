@@ -139,6 +139,11 @@ class SimConfig:
     # (transition_time_seconds + safety_margin_seconds).
     pcf_priority_margin_multiplier: float = 1.5
 
+    # --- Decision history (traffic_sim.ai.agent.AIAgent.decision_history) ---
+    # How many recent DecisionRecord rows to retain in memory for the
+    # dashboard/API layer. Bounded so a long run can't grow this unbounded.
+    decision_history_size: int = 500
+
     def validate(self) -> None:
         """Raise ValueError on any structurally unsound configuration."""
         if self.num_cells <= 0:
@@ -165,6 +170,8 @@ class SimConfig:
             raise ValueError("pcf_priority_threshold must be >= 0")
         if self.pcf_priority_margin_multiplier < 1.0:
             raise ValueError("pcf_priority_margin_multiplier must be >= 1.0")
+        if self.decision_history_size <= 0:
+            raise ValueError("decision_history_size must be > 0")
         if self.segment_bitrate_mbps_min <= 0:
             raise ValueError("segment_bitrate_mbps_min must be > 0")
         if self.segment_bitrate_mbps_max < self.segment_bitrate_mbps_min:
