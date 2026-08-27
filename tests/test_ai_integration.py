@@ -40,6 +40,55 @@ def test_ai_agent_is_wired_to_the_content_catalogue():
     assert simulator.mode_selector._content_server is simulator.content_server
 
 
+def test_mbos_and_pcf_run_on_every_real_decision():
+    """End-to-end proof that MBOS/PCF are actually wired into the live
+    pipeline, not just unit-testable in isolation.
+
+    `current_tick_stats()` is only populated between the end of a tick's
+    decisions and the following `observe()` call, so decisions are
+    captured live via a spy rather than read after the run completes
+    (by then the last tick's `observe()` has already cleared them).
+    """
+    from traffic_sim.ai.agent import AIAgent
+
+    cfg = SimConfig.default().with_overrides(random_seed=11)
+    simulator = build_simulator(cfg, "ai", "flash_crowd")
+    captured = []
+    original_decide = AIAgent.decide
+
+    def spy(self, *args, **kwargs):
+        decision = original_decide(self, *args, **kwargs)
+        captured.append(decision)
+        return decision
+
+    AIAgent.decide = spy
+    try:
+        simulator.run(duration_s=10 * cfg.simulation_timestep_s)
+    finally:
+        AIAgent.decide = original_decide
+
+    assert len(captured) > 0
+    for decision in captured:
+        assert decision.session_id  # non-empty "cell_id:segment_id"
+        assert decision.target_bearer in ("cellular", "broadcast")
+        assert isinstance(decision.handover, bool)
+        assert isinstance(decision.pcf_compliant, bool)
+        assert isinstance(decision.pcf_violated_rules, list)
+        assert "mbos" in decision.reason and "pcf" in decision.reason
+
+
+def test_baselines_never_touch_mbos_or_pcf():
+    """MBOS/PCF are part of the AI pipeline specifically - fixed-rule
+    selectors must remain raw, unpoliced comparison points."""
+    from traffic_sim.simulation.mode_selectors import always_broadcast
+
+    cfg = SimConfig.default().with_overrides(random_seed=11)
+    simulator = build_simulator(cfg, "always-broadcast", "flash_crowd")
+    assert simulator.mode_selector is always_broadcast
+    assert not hasattr(simulator.mode_selector, "mbos")
+    assert not hasattr(simulator.mode_selector, "pcf")
+
+
 def test_switch_count_and_inference_latency_are_no_longer_placeholders():
     simulator = run_ai()
     records = simulator.kpi_engine.to_records()

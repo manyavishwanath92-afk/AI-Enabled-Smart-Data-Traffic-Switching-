@@ -129,6 +129,16 @@ class SimConfig:
     # Utility weights (see traffic_sim.ai.utility). None -> DEFAULT_WEIGHTS.
     utility_weights: dict[str, float] | None = None
 
+    # --- PCF policy layer (traffic_sim.policy.pcf) ---
+    # Segments at or above this service_priority get a stricter buffer
+    # margin before PCF permits any mode change this tick — delay-sensitive
+    # content gets a stronger continuity guarantee than the agent's single
+    # fixed margin provides (Guide Section 10.5).
+    pcf_priority_threshold: int = 1
+    # How much larger that margin is, as a multiple of the agent's base
+    # (transition_time_seconds + safety_margin_seconds).
+    pcf_priority_margin_multiplier: float = 1.5
+
     def validate(self) -> None:
         """Raise ValueError on any structurally unsound configuration."""
         if self.num_cells <= 0:
@@ -151,6 +161,10 @@ class SimConfig:
             raise ValueError("cooldown_period_s must be >= 0")
         if not 0.0 <= self.min_decision_confidence <= 1.0:
             raise ValueError("min_decision_confidence must be in [0, 1]")
+        if self.pcf_priority_threshold < 0:
+            raise ValueError("pcf_priority_threshold must be >= 0")
+        if self.pcf_priority_margin_multiplier < 1.0:
+            raise ValueError("pcf_priority_margin_multiplier must be >= 1.0")
         if self.segment_bitrate_mbps_min <= 0:
             raise ValueError("segment_bitrate_mbps_min must be > 0")
         if self.segment_bitrate_mbps_max < self.segment_bitrate_mbps_min:

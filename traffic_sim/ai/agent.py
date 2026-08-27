@@ -29,13 +29,22 @@ Order of reasoning, per tick:
        b. low confidence - the two options are nearly tied
        c. hysteresis    - the gain is real but too small to be worth churn
        d. cooldown      - this group switched too recently
+  6. MBOS   -> mbos.controller.MBOSController: coordinate a session/bearer
+     for the resulting mode (session id, target bearer, handover flag)
+  7. PCF    -> policy.pcf.PCFPolicy: independently re-validate the
+     MBOS-coordinated mode against policy rules (priority-scaled buffer
+     margin, confidence floor), able to revert to the incumbent mode
 
 Steps 5a-5d are why the agent exists. Without them a marginally better
 score would flip a group's delivery mode every tick, which costs more in
 churn than it gains in throughput. Coordination (step 0) and these gates
 solve two different causes of the same symptom: coordination stops
 groups from herding on a shared signal; the gates stop a single group
-from flip-flopping on its own marginal, noisy re-evaluations.
+from flip-flopping on its own marginal, noisy re-evaluations. Steps 6-7
+are deliberately separate from the agent's own reasoning: MBOS's job is
+session/path coordination, not decision-making, and PCF's job is policy
+enforcement independent of (and after) the agent that proposed the mode —
+neither duplicates `_apply_safety_gates`.
 
 `AIAgent` is a callable object with the exact `ModeSelectorFn` signature,
 so it drops into the simulator's existing seam with no interface change.
@@ -43,7 +52,10 @@ It also exposes `prepare_tick()` (coordination, called once per tick
 before any group is decided) and `observe()` (closed-loop feedback,
 called once per tick after delivery) — both are optional hooks the
 Simulator calls only if they exist, so plain-rule selectors are
-completely unaffected.
+completely unaffected. MBOS and PCF are internal to the AI pipeline
+specifically (owned by `AIAgent`, not the Simulator), so fixed-rule
+baselines (`always_unicast`, `rule_by_group_size`, ...) remain
+unpoliced, "raw" comparison points for `traffic_sim.experiments.compare`.
 """
 
 from __future__ import annotations
@@ -56,6 +68,8 @@ from traffic_sim.ai.feature_engineering import extract_features
 from traffic_sim.ai.predict import OutcomePredictor
 from traffic_sim.ai.utility import UtilityBreakdown, compute_utility, resolve_weights
 from traffic_sim.content.content_server import ContentServer
+from traffic_sim.mbos.controller import MBOSController, bearer_for
+from traffic_sim.policy.pcf import PCFPolicy
 from traffic_sim.simulation.cell import Cell
 from traffic_sim.simulation.user import DeliveryMode, UE
 
@@ -74,6 +88,15 @@ class AIDecision:
     prediction_source: str
     inference_latency_ms: float
     switched: bool
+    # MBOS — session/bearer coordination (traffic_sim.mbos.controller).
+    session_id: str
+    target_bearer: str
+    handover: bool
+    # PCF — independent policy enforcement (traffic_sim.policy.pcf). May
+    # have overridden `mode` back to the incumbent; violated_rules is
+    # empty when compliant.
+    pcf_compliant: bool
+    pcf_violated_rules: list[str]
 
 
 @dataclass
@@ -103,6 +126,8 @@ class AIAgent:
         self.config = config
         self._content_server = content_server
         self.predictor = OutcomePredictor(config, model_dir)
+        self.mbos = MBOSController()
+        self.pcf = PCFPolicy(config)
         self._groups: dict[tuple[str, str], _GroupState] = {}
         self._prev_congestion: dict[str, float] = {}
         self._prev_broadcast_groups: dict[str, int] = {}
@@ -273,6 +298,42 @@ class AIAgent:
             )
             reason["action"] = hold_reason
 
+        # MBOS — coordinate a session/bearer for whatever the agent's own
+        # reasoning settled on, regardless of whether that was a hold or a
+        # switch (session/handover tracking must run every tick either way).
+        mbos_result = self.mbos.coordinate(cell_id=key[0], segment_id=key[1], mode=final)
+
+        # PCF — independent policy re-validation of the MBOS-coordinated
+        # mode. May revert back to the incumbent mode; that reversion is
+        # what actually gets committed below, not the agent's own proposal.
+        pcf_result = self.pcf.enforce(
+            mode=mbos_result.mode,
+            current_mode=current,
+            service_priority=int(plan.features.values["service_priority"]),
+            buffer_min_s=plan.features.buffer_min_s,
+            confidence=confidence,
+        )
+        final = pcf_result.final_mode
+
+        # If PCF reverted the mode, MBOS's proposed bearer/handover no
+        # longer describe what's actually being delivered — reconcile
+        # them against the true final mode rather than report a bearer
+        # switch that didn't happen.
+        reported_bearer = mbos_result.target_bearer
+        reported_handover = mbos_result.handover
+        if final != mbos_result.mode:
+            reported_bearer = bearer_for(final)
+            reported_handover = False
+
+        reason["mbos"] = mbos_result.explain()
+        reason["pcf"] = pcf_result.explain()
+        if not pcf_result.compliant:
+            reason["action"] = "hold_pcf_policy_violation"
+            reason["mbos"]["target_bearer"] = reported_bearer
+            reason["mbos"]["handover"] = reported_handover
+
+        self.mbos.confirm(cell_id=key[0], segment_id=key[1], mode=final)
+
         switched = current is not None and final != current
         if switched:
             state.last_switch_time_s = self._sim_time_s
@@ -289,6 +350,11 @@ class AIAgent:
             prediction_source=prediction_source,
             inference_latency_ms=inference_latency_ms,
             switched=switched,
+            session_id=mbos_result.session_id,
+            target_bearer=reported_bearer,
+            handover=reported_handover,
+            pcf_compliant=pcf_result.compliant,
+            pcf_violated_rules=pcf_result.violated_rules,
         )
         self._tick_decisions.append(decision)
         return decision

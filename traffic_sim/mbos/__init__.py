@@ -1,9 +1,6 @@
-"""Deferred to Phase 2/3 per the project build guide.
+"""MBOS control layer — see controller.py.
 
-Will eventually hold: controller.py (MBOS control-plane coordination of
-the AI decision), session_manager.py, delivery_switch.py (data-plane
-path/session coordination). This is a simulated controller only — not a
-standards-compliant MBOS implementation. No logic exists here in Phase 1;
-`traffic_sim.simulation.simulator.Simulator` invokes delivery directly via
-its `mode_selector` seam.
+Simulated session/path coordination between the AI agent's chosen
+delivery mode and the data plane (`traffic_sim.delivery`). Not a
+standards-compliant MBOS implementation.
 """
