@@ -5,9 +5,12 @@ than decided internally, so the simulator never needs to know whether it
 is being driven by a fixed rule or by the AI agent — see
 traffic_sim.simulation.mode_selectors.
 
-Selectors may optionally expose two extra hooks, which the AI agent uses
-and plain functions simply do not have:
+Selectors may optionally expose three extra hooks, which the AI agent
+uses and plain functions simply do not have:
 
+  prepare_tick(groups, cells_by_id, config) -> coordinate a decision
+      across every group in a cell before any of them is decided
+      individually (see traffic_sim.ai.cell_controller)
   current_tick_stats()  -> decision telemetry for the KPI engine
   observe(cells, results, record) -> closed-loop feedback after delivery
 """
@@ -80,6 +83,15 @@ class Simulator:
             if ue.cell_id is None or ue.requested_segment is None:
                 continue
             groups.setdefault((ue.cell_id, ue.requested_segment), []).append(ue)
+
+        # Optional coordination pass: a selector that wants to decide every
+        # group in a cell together (rather than each group reacting to the
+        # same signal independently) gets first look at the full group
+        # listing here. Plain-rule selectors do not implement this and are
+        # unaffected.
+        prepare_tick = getattr(self.mode_selector, "prepare_tick", None)
+        if callable(prepare_tick):
+            prepare_tick(groups, cells_by_id, cfg)
 
         # Pass 1 — decide every group's delivery mode BEFORE delivering any
         # of them, so we can count how many UEs each cell is actually

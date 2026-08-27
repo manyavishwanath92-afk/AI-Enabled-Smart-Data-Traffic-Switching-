@@ -69,35 +69,62 @@ broadcast is genuinely the right answer, and the AI finds it:
 
 | policy | resource saved | continuity | QoE | switches |
 |---|---|---|---|---|
-| always-unicast | 0.000 | 0.713 | 0.201 | 0 |
-| always-broadcast | 0.844 | 1.000 | 0.486 | 0 |
-| rule-by-group-size | 0.293 | 0.820 | 0.264 | 0 |
-| **ai** | **0.821** | **1.000** | **0.490** | 4 |
+| always-unicast | 0.000 | 0.678 | 0.186 | 0 |
+| always-broadcast | 0.839 | 1.000 | 0.485 | 0 |
+| rule-by-group-size | 0.289 | 0.795 | 0.250 | 0 |
+| **ai** | 0.758 | **1.000** | **0.497** | 50.7 |
+
+Switch count is higher here than the constrained-carrier case below —
+see the note under "Cell-level coordination" for why: with an abundant
+carrier and scattered background traffic, a cell can have 6-8 concurrent
+broadcast candidates, and which exact set fits shifts slightly as
+individual UEs' radio conditions drift tick to tick. Outcomes (savings,
+continuity, QoE) are barely affected; this is a churn cost that was not
+present before coordination was added and is flagged here rather than
+hidden, in the same spirit as the constrained-carrier tradeoffs below.
 
 **Constrained carrier (4 Mbps)** — broadcasting everything now destroys
 service, and the AI backs off:
 
 | policy | resource saved | continuity | QoE | switches |
 |---|---|---|---|---|
-| always-unicast | 0.000 | 0.755 | 0.224 | 0 |
-| always-broadcast | 0.841 | **0.457** | 0.075 | 0 |
-| rule-by-group-size | 0.302 | **0.864** | 0.294 | 0 |
-| **ai** | 0.267 | 0.840 | 0.263 | 98.7 |
+| always-unicast | 0.000 | 0.713 | 0.202 | 0 |
+| always-broadcast | 0.846 | **0.442** | 0.072 | 0 |
+| rule-by-group-size | 0.302 | 0.829 | 0.270 | 0 |
+| **ai** | 0.186 | **0.865** | **0.303** | 37.7 |
 
-**Honest reading.** The AI adapts — broadcast share falls from ~97% to
-~27% as the carrier shrinks, and it beats always-broadcast on continuity
-by a wide margin (0.840 vs 0.457) where blind broadcasting collapses.
-But in this constrained regime the naive group-size rule still edges it
-out on both continuity (0.864) and savings (0.302), and the AI churns
-badly (98.7 switches vs 0).
+(Same matched seeds and tick count as the default-carrier table above;
+figures are the `--compare` output for `broadcast_cell_capacity_mbps=4.0`.)
 
-The cause is a coordination problem, not a tuning problem: every group
-reads the same shared-carrier signal and reacts identically, so they
-leave together, the carrier looks free, and they pile back. Exponentially
-smoothing that signal was tried — churn fell to 79 switches but
-continuity and savings got slightly worse, so it was not kept. Fixing
-this properly needs cell-level admission control (deciding how many
-streams the carrier admits) rather than independent per-group decisions.
+**Cell-level coordination.** Independently-decided groups produced the
+same herd oscillation described above — every group reacted to the same
+shared-carrier contention reading, so a busy carrier made the whole cell
+leave broadcast at once, which made it look free, which drew them all
+back (98.7 switches/60 ticks). `traffic_sim/ai/cell_controller.py` fixes
+this by deciding once per cell instead of once per group: every
+candidate is ranked by `broadcast_benefit = max(0, U_broadcast −
+U_unicast)`, then admitted to the shared carrier highest-benefit-first,
+only while the carrier can still sustain the bitrate of every group
+already admitted (both its raw `broadcast_capacity_mbps` and each
+group's own worst-case Shannon capacity, divided across everyone
+sharing it). Groups that don't fit stay on unicast.
+
+This took switching **98.7 → 37.7** (62% fewer) and flipped the
+comparison against the naive rule: before coordination the AI's
+continuity (0.840) trailed the rule's (0.864); afterward the AI's (0.865)
+**beats** it. Diagnosing the remaining churn found the ranking itself was
+unstable at the margin — a group's own utility gap stays large even when
+it's the admission *boundary* that's wobbling, so the existing hysteresis
+gate (which only looks at raw utility gap) never damped it. The fix
+reuses `hysteresis_margin` as a small ranking tie-break favouring
+whichever group already holds a broadcast seat, so a newcomer must be
+genuinely better, not just marginally luckier this tick, to bump it.
+
+Two prior, smaller-scope attempts were tried and rejected because they
+didn't clearly pay off: exponentially smoothing the shared contention
+signal cut churn to 79 but slightly hurt continuity and savings; a
+looser admission check helped less than the ranking fix. Both were
+reverted rather than kept as unproven complexity.
 
 Two known limitations worth stating plainly:
 - Tree models cannot extrapolate. An early version trained at a single

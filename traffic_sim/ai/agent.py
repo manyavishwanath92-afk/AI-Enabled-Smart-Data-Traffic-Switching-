@@ -4,12 +4,26 @@ It is not the model, and it is not the utility function. Those answer
 "what will happen" and "which outcome is better". The agent answers a
 third question: "what are we actually allowed to do right now?"
 
-Order of reasoning, per (cell, segment) group, per tick:
+Order of reasoning, per tick:
 
-  1. read telemetry            -> ai.feature_engineering
-  2. predict both outcomes     -> ai.predict (XGBoost, or analytical)
-  3. score both outcomes       -> ai.utility
-  4. pick the better score
+  0. (if the simulator supports it) COORDINATE across the whole cell
+     first -> ai.cell_controller. Every group's telemetry, prediction and
+     utility are computed together, ranked by how much each would gain
+     from broadcast, and admitted to the shared broadcast carrier
+     highest-gain-first while it can still sustain everyone admitted.
+     This is what prevents groups from reacting to the same contention
+     signal independently and moving in lockstep (measured at ~99
+     switches/run before this existed — see README).
+
+  Then, per (cell, segment) group:
+
+  1. read telemetry            -> ai.feature_engineering  (cached by step 0)
+  2. predict both outcomes     -> ai.predict               (cached by step 0)
+  3. score both outcomes       -> ai.utility                (cached by step 0)
+  4. take the coordinated candidate from step 0 (or, if step 0 did not
+     run for this tick — e.g. direct calls to `decide()` in a test — fall
+     back to this group's own utility argmax, exactly as before
+     coordination existed)
   5. refuse to act if unsafe:
        a. buffer safety - too little margin to survive a switch
        b. low confidence - the two options are nearly tied
@@ -18,12 +32,18 @@ Order of reasoning, per (cell, segment) group, per tick:
 
 Steps 5a-5d are why the agent exists. Without them a marginally better
 score would flip a group's delivery mode every tick, which costs more in
-churn than it gains in throughput.
+churn than it gains in throughput. Coordination (step 0) and these gates
+solve two different causes of the same symptom: coordination stops
+groups from herding on a shared signal; the gates stop a single group
+from flip-flopping on its own marginal, noisy re-evaluations.
 
 `AIAgent` is a callable object with the exact `ModeSelectorFn` signature,
 so it drops into the simulator's existing seam with no interface change.
-It also exposes `observe()`, which the simulator calls after each tick —
-that is the closed loop: what happened feeds the next decision.
+It also exposes `prepare_tick()` (coordination, called once per tick
+before any group is decided) and `observe()` (closed-loop feedback,
+called once per tick after delivery) — both are optional hooks the
+Simulator calls only if they exist, so plain-rule selectors are
+completely unaffected.
 """
 
 from __future__ import annotations
@@ -31,6 +51,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from config.config import SimConfig
+from traffic_sim.ai.cell_controller import GroupPlan, admit_to_broadcast
 from traffic_sim.ai.feature_engineering import extract_features
 from traffic_sim.ai.predict import OutcomePredictor
 from traffic_sim.ai.utility import UtilityBreakdown, compute_utility, resolve_weights
@@ -87,6 +108,11 @@ class AIAgent:
         self._prev_broadcast_groups: dict[str, int] = {}
         self._sim_time_s = 0.0
         self._tick_decisions: list[AIDecision] = []
+        # Populated by prepare_tick(); looked up by decide(). Empty when
+        # prepare_tick() was not called this tick, in which case decide()
+        # falls back to computing everything for itself (see decide()).
+        self._tick_plans: dict[tuple[str, str], GroupPlan] = {}
+        self._coordinated_modes: dict[tuple[str, str], DeliveryMode] = {}
 
     def attach(self, content_server: ContentServer) -> None:
         """Give the agent the content catalogue.
@@ -113,11 +139,17 @@ class AIAgent:
     def __call__(self, segment_id: str, ues: list[UE], cell: Cell, config: SimConfig) -> DeliveryMode:
         return self.decide(segment_id, ues, cell, config).mode
 
-    def decide(self, segment_id: str, ues: list[UE], cell: Cell, config: SimConfig) -> AIDecision:
-        key = (cell.cell_id, segment_id)
-        state = self._groups.setdefault(key, _GroupState())
-        segment = self._segment_for(segment_id)
+    def _build_plan(
+        self, key: tuple[str, str], segment_id: str, ues: list[UE], cell: Cell, config: SimConfig
+    ) -> GroupPlan:
+        """Run telemetry -> prediction -> utility for one group.
 
+        Shared by `prepare_tick()` (called once per group, for every group
+        in a cell) and `decide()`'s fallback path (called for a single
+        group when no coordination pass has run this tick), so the two
+        paths can never compute this differently.
+        """
+        segment = self._segment_for(segment_id)
         features = extract_features(
             segment,
             ues,
@@ -128,6 +160,7 @@ class AIAgent:
         )
         prediction = self.predictor.predict(features)
         weights = resolve_weights(features, config)
+        state = self._groups.setdefault(key, _GroupState())
 
         u_unicast = compute_utility(
             DeliveryMode.UNICAST, prediction.outcomes.unicast, features, config, state.current_mode, weights
@@ -136,10 +169,78 @@ class AIAgent:
             DeliveryMode.BROADCAST, prediction.outcomes.broadcast, features, config, state.current_mode, weights
         )
 
-        best, other = (
-            (u_broadcast, u_unicast) if u_broadcast.total > u_unicast.total else (u_unicast, u_broadcast)
+        return GroupPlan(
+            key=key,
+            features=features,
+            outcomes=prediction.outcomes,
+            utility_unicast=u_unicast,
+            utility_broadcast=u_broadcast,
+            broadcast_benefit=max(0.0, u_broadcast.total - u_unicast.total),
+            prediction_source=prediction.source,
+            inference_latency_ms=prediction.inference_latency_ms,
+            current_mode=state.current_mode,
         )
-        candidate = best.mode
+
+    def prepare_tick(
+        self,
+        groups: dict[tuple[str, str], list[UE]],
+        cells_by_id: dict[str, Cell],
+        config: SimConfig,
+    ) -> None:
+        """Coordinate one broadcast-admission decision per cell.
+
+        Called once per tick by the Simulator, before any `decide()` call
+        for that tick (an optional hook — see module docstring). Builds
+        every group's plan up front, ranks each cell's candidates by
+        `broadcast_benefit`, and admits them to the shared broadcast
+        carrier while it can still sustain everyone admitted
+        (`ai.cell_controller.admit_to_broadcast`). `decide()` then simply
+        looks up the resulting mode instead of comparing utilities alone,
+        which is what stops every group from reacting to the same
+        contention signal independently.
+        """
+        self._tick_plans = {}
+        self._coordinated_modes = {}
+
+        plans_by_cell: dict[str, list[GroupPlan]] = {}
+        for (cell_id, segment_id), ues in groups.items():
+            key = (cell_id, segment_id)
+            plan = self._build_plan(key, segment_id, ues, cells_by_id[cell_id], config)
+            self._tick_plans[key] = plan
+            plans_by_cell.setdefault(cell_id, []).append(plan)
+
+        for cell_plans in plans_by_cell.values():
+            admitted_keys = admit_to_broadcast(cell_plans, stickiness=config.hysteresis_margin)
+            for plan in cell_plans:
+                self._coordinated_modes[plan.key] = (
+                    DeliveryMode.BROADCAST if plan.key in admitted_keys else DeliveryMode.UNICAST
+                )
+
+    def decide(self, segment_id: str, ues: list[UE], cell: Cell, config: SimConfig) -> AIDecision:
+        key = (cell.cell_id, segment_id)
+        state = self._groups.setdefault(key, _GroupState())
+
+        plan = self._tick_plans.get(key)
+        coordinated = key in self._coordinated_modes
+        if plan is None:
+            # No prepare_tick() this tick (e.g. a test calling decide()
+            # directly) — fall back to this group's own utility argmax,
+            # exactly the pre-coordination behaviour.
+            plan = self._build_plan(key, segment_id, ues, cell, config)
+
+        u_unicast = plan.utility_unicast
+        u_broadcast = plan.utility_broadcast
+        prediction_source = plan.prediction_source
+        inference_latency_ms = plan.inference_latency_ms
+        outcome_by_mode = {DeliveryMode.UNICAST: plan.outcomes.unicast, DeliveryMode.BROADCAST: plan.outcomes.broadcast}
+
+        if coordinated:
+            candidate = self._coordinated_modes[key]
+            best = u_broadcast if candidate == DeliveryMode.BROADCAST else u_unicast
+        else:
+            best = u_broadcast if u_broadcast.total > u_unicast.total else u_unicast
+            candidate = best.mode
+
         gap = abs(u_broadcast.total - u_unicast.total)
         confidence = min(gap / 0.25, 1.0)  # 0.25 utility apart = fully confident
 
@@ -147,8 +248,10 @@ class AIAgent:
         reason: dict[str, object] = {
             "candidate": candidate.value,
             "utility_gap": round(gap, 4),
+            "broadcast_benefit": round(plan.broadcast_benefit, 4),
             "winning_terms": best.explain(),
-            "prediction_source": prediction.source,
+            "prediction_source": prediction_source,
+            "coordination": "cell_admission" if coordinated else "independent",
         }
 
         final = candidate
@@ -157,14 +260,10 @@ class AIAgent:
         elif candidate == current:
             reason["action"] = "hold_already_optimal"
         else:
-            outcome_by_mode = {
-                DeliveryMode.UNICAST: prediction.outcomes.unicast,
-                DeliveryMode.BROADCAST: prediction.outcomes.broadcast,
-            }
             final, hold_reason = self._apply_safety_gates(
                 candidate,
                 current,
-                features,
+                plan.features,
                 gap,
                 confidence,
                 config,
@@ -185,10 +284,10 @@ class AIAgent:
             reason=reason,
             utility_unicast=u_unicast.total,
             utility_broadcast=u_broadcast.total,
-            predicted_unicast_mbps=prediction.outcomes.unicast.achievable_mbps,
-            predicted_broadcast_mbps=prediction.outcomes.broadcast.achievable_mbps,
-            prediction_source=prediction.source,
-            inference_latency_ms=prediction.inference_latency_ms,
+            predicted_unicast_mbps=plan.outcomes.unicast.achievable_mbps,
+            predicted_broadcast_mbps=plan.outcomes.broadcast.achievable_mbps,
+            prediction_source=prediction_source,
+            inference_latency_ms=inference_latency_ms,
             switched=switched,
         )
         self._tick_decisions.append(decision)
@@ -292,6 +391,11 @@ class AIAgent:
         self._prev_broadcast_groups = broadcast_counts
 
         self._tick_decisions = []
+        # Belt-and-braces: prepare_tick() already resets these at the start
+        # of the next tick, but clearing here too means a tick where it is
+        # NOT called can't accidentally reuse a stale coordinated plan.
+        self._tick_plans = {}
+        self._coordinated_modes = {}
         self._sim_time_s = getattr(
             record, "sim_time_s", self._sim_time_s + self.config.simulation_timestep_s
         )

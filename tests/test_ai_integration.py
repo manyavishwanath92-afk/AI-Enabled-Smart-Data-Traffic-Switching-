@@ -84,6 +84,28 @@ def test_ai_protects_continuity_relative_to_blind_broadcasting():
     assert rows["ai"]["mean_qoe"] > rows["always-broadcast"]["mean_qoe"]
 
 
+def test_cell_level_coordination_sharply_reduces_switching_under_a_constrained_carrier():
+    """Before cell-level admission control, every group reacted to the
+    same shared-carrier signal independently and the whole cell herded
+    on and off broadcast together - measured at ~99 switches/60 ticks
+    under a 4 Mbps carrier. Coordinating the decision once per cell must
+    bring that down decisively, not just marginally."""
+    cfg = SimConfig.default().with_overrides(broadcast_cell_capacity_mbps=4.0)
+    rows = {row.policy: row.summary for row in run_comparison(cfg, ticks=60, seeds=(11, 22, 33))}
+
+    assert rows["ai"]["total_switches"] < 60.0  # well below the ~99 measured before coordination
+
+
+def test_ai_beats_the_naive_rule_on_continuity_under_a_constrained_carrier():
+    """The naive group-size rule doesn't know the carrier is contended at
+    all. Once coordination stops the AI from oscillating, it should
+    out-perform a rule that can't reason about shared capacity."""
+    cfg = SimConfig.default().with_overrides(broadcast_cell_capacity_mbps=4.0)
+    rows = {row.policy: row.summary for row in run_comparison(cfg, ticks=60, seeds=(11, 22, 33))}
+
+    assert rows["ai"]["service_continuity"] > rows["rule-by-group-size"]["service_continuity"]
+
+
 def test_ai_saves_resources_relative_to_always_unicast_when_broadcast_is_viable():
     cfg = SimConfig.default().with_overrides(broadcast_cell_capacity_mbps=60.0)
     rows = {row.policy: row.summary for row in run_comparison(cfg, ticks=30, seeds=(11, 22))}
