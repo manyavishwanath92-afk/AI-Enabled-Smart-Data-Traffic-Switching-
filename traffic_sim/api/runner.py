@@ -34,6 +34,7 @@ from typing import Any
 
 from config.config import SimConfig
 from traffic_sim.api.schemas import (
+    cell_to_dict,
     decision_record_to_dict,
     decision_to_dict,
     delivery_result_to_dict,
@@ -45,6 +46,7 @@ SCENARIOS = ("uniform", "flash_crowd")
 
 STATUS_PENDING = "pending"
 STATUS_RUNNING = "running"
+STATUS_PAUSED = "paused"
 STATUS_COMPLETED = "completed"
 STATUS_STOPPED = "stopped"
 STATUS_FAILED = "failed"
@@ -78,6 +80,10 @@ class SimulationRunner:
 
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
+        # Set means "may step". Checked outside the lock, so a paused run
+        # still answers status queries and responds to stop().
+        self._resume_event = threading.Event()
+        self._resume_event.set()
         self._thread: threading.Thread | None = None
         self._status = STATUS_PENDING
         self._error: str | None = None
@@ -131,6 +137,10 @@ class SimulationRunner:
     def _run(self) -> None:
         try:
             while not self._stop_event.is_set():
+                # Wait out a pause without holding the lock, re-checking stop
+                # each time so a paused run can still be stopped or deleted.
+                if not self._resume_event.wait(timeout=0.1):
+                    continue
                 with self._lock:
                     if self._current_tick >= self.total_ticks:
                         break
@@ -147,7 +157,9 @@ class SimulationRunner:
             return
 
         with self._lock:
-            if self._status == STATUS_RUNNING:
+            # PAUSED is included: stop() releases a paused run, and it must
+            # settle on a terminal status rather than stay "paused" forever.
+            if self._status in (STATUS_RUNNING, STATUS_PAUSED):
                 self._status = STATUS_STOPPED if self._stop_event.is_set() else STATUS_COMPLETED
 
     def _publish_tick(self, record) -> None:
@@ -163,12 +175,38 @@ class SimulationRunner:
             "simulation_id": self.sim_id,
             "tick": record.tick,
             "kpi": asdict(record),
+            # Cells ride along so the live network view is fully push-driven
+            # rather than polling /cells alongside the socket. There are only
+            # a handful per run, so the cost is negligible. UEs deliberately
+            # do not: ~100 objects a tick is real bandwidth for state that
+            # changes slowly, and /ues serves them well enough on demand.
+            "cells": [cell_to_dict(c) for c in self.simulator.cells],
             "decisions": list(self._latest_decisions),
             "groups": list(self._latest_groups),
         }
 
+    def pause(self) -> bool:
+        """Hold the run between ticks. No-op unless it is actually running."""
+        with self._lock:
+            if self._status != STATUS_RUNNING:
+                return False
+            self._status = STATUS_PAUSED
+        self._resume_event.clear()
+        return True
+
+    def resume(self) -> bool:
+        """Continue a paused run. No-op unless it is actually paused."""
+        with self._lock:
+            if self._status != STATUS_PAUSED:
+                return False
+            self._status = STATUS_RUNNING
+        self._resume_event.set()
+        return True
+
     def stop(self) -> None:
         self._stop_event.set()
+        # A paused run would otherwise sit in its wait loop and never notice.
+        self._resume_event.set()
 
     def join(self, timeout: float | None = None) -> None:
         thread = self._thread

@@ -188,47 +188,37 @@ Every field: **name**, **meaning**, **unit**, **source**, **granularity**, **bac
 
 ### 3.4 AI Decision / Explainability
 
-All from `traffic_sim/ai/agent.py :: AIDecision`, one per (cell, segment) group, per tick — produced by `AIAgent.decide()`, served by `GET /api/simulations/{id}/decisions/latest`.
+**Deliberately simplified.** The dashboard shows a *conclusion*, not a derivation: the final delivery mode, how confident the agent was, and one plain-English sentence. The internal chain — the two XGBoost rate predictions, the per-term utility breakdown, the cell-admission ranking, the MBOS/PCF internals — still runs and is still tested, but it is **not exposed through the API** and should not appear on screen. It is engineering detail, not something a viewer can act on.
 
-Inside the simulator these objects are transient (cleared by `AIAgent.observe()` at the end of every tick), so the API captures them as they pass through `KPIEngine.record_tick` and retains **the latest tick only**. That is enough for a live explainability panel — "why did the AI just do that?" — but there is no full-detail decision *history*. For decisions across ticks, use the persisted, dashboard-sized `DecisionRecord` rows in 3.7 (`/decisions/history`), which cover the final mode and its headline reasoning but not the nested `reason.winning_terms` breakdown.
+Served by `GET /api/simulations/{id}/decisions/latest` (and included on every WebSocket tick). Derived from `traffic_sim/ai/agent.py :: AIDecision`, one per (cell, segment) group per tick; the sentence is rendered by `traffic_sim/api/explain.py :: explain_decision()`, which is presentation only — it adds no logic and no thresholds of its own.
 
-| Field | Meaning | Unit | Backend/Frontend |
-|---|---|---|---|
-| `mode` | Final decided mode, after MBOS + PCF | enum | Backend |
-| `cell_id` | Which cell this decision belongs to | string | Backend |
-| `segment_id` | Which content segment/group this decision belongs to | string | Backend |
-| `previous_mode` | The mode this group was in immediately before this decision (`null` on its first-ever decision) | enum or null | Backend |
-| `confidence` | How decisively the utility scores favoured this mode (0 = tied, 1 = ≥0.25 apart) | 0–1 | Backend |
-| `reason.candidate` | What the cell-coordinated ranking proposed before safety gates | string | Backend |
-| `reason.utility_gap` | `|U_broadcast − U_unicast|` | utility units | Backend |
-| `reason.broadcast_benefit` | `max(0, U_broadcast − U_unicast)` — the cell-controller's ranking score | utility units | Backend |
-| `reason.winning_terms` | The chosen mode's utility breakdown by term (see 3.4.1) | dict | Backend |
-| `reason.prediction_source` | `"xgboost"` or `"analytical"` | string | Backend |
-| `reason.coordination` | `"cell_admission"` or `"independent"` (fallback path) | string | Backend |
-| `reason.action` | Which safety/policy outcome fired: `initial_assignment`, `hold_already_optimal`, `switch`, `hold_buffer_unsafe`, `hold_low_confidence`, `hold_within_hysteresis`, `hold_cooldown`, `switch_escape_stall`, `hold_pcf_policy_violation` | string (enum-like) | Backend |
-| `reason.mbos` | `{session_id, target_bearer, handover, corrected}` | dict | Backend |
-| `reason.pcf` | `{compliant, violated_rules}` | dict | Backend |
-| `utility_unicast`, `utility_broadcast` | Total utility score per mode | float | Backend |
-| `predicted_unicast_mbps`, `predicted_broadcast_mbps` | XGBoost's (or the analytical fallback's) predicted achievable rate per mode | Mbps | Backend |
-| `prediction_source` | Same as `reason.prediction_source`, top-level for convenience | string | Backend |
-| `inference_latency_ms` | Time this one prediction took | ms | Backend |
-| `switched` | Did the mode actually change this tick | bool | Backend |
-| `session_id` | MBOS session id, `"{cell_id}:{segment_id}"` | string | Backend |
-| `target_bearer` | `"cellular"` or `"broadcast"` | string | Backend |
-| `handover` | Bearer changed vs. last tick | bool | Backend |
-| `pcf_compliant` | Did the decision pass PCF unmodified | bool | Backend |
-| `pcf_violated_rules` | Which PCF rules fired (`priority_buffer_margin`, `confidence_floor`) | list[string] | Backend |
+| Field | Meaning | Unit | Granularity | Backend/Frontend |
+|---|---|---|---|---|
+| `cell_id` | Which cell this decision belongs to | string | per-group, per-tick | Backend |
+| `group_id` | Which content segment/group | string | per-group, per-tick | Backend |
+| `selected_mode` | **The FINAL mode, after MBOS coordination and PCF enforcement** — never the agent's pre-policy candidate | `"unicast"` / `"broadcast"` | per-group, per-tick | Backend |
+| `previous_mode` | The mode in force immediately before this decision (`null` on a group's first decision) | string or null | per-group, per-tick | Backend |
+| `switched` | Did the mode actually change this tick | bool | per-group, per-tick | Backend |
+| `confidence` | How decisively the two options separated (0 = tied, 1 = clearly apart) | 0–1 | per-group, per-tick | Backend |
+| `explanation` | One human-readable sentence saying what happened and why | string | per-group, per-tick | Backend |
+| `bearer` | The physical bearer carrying it: `"cellular"` or `"broadcast"` | string | per-group, per-tick | Backend |
+| `policy_compliant` | `false` when PCF overrode the agent's choice | bool | per-group, per-tick | Backend |
 
-**3.4.1 — `winning_terms` detail** (`traffic_sim/ai/utility.py :: UtilityBreakdown.explain()`), each already weight-multiplied and in [0,1] roughly:
+**The nine explanations**, one per outcome the agent can reach:
 
-| Term | Meaning |
+| Situation | Sentence shown |
 |---|---|
-| `quality` | Can this mode sustain the segment's bitrate? |
-| `resource` | Resource saved vs. cell capacity, earned only in proportion to delivery quality |
-| `buffer` | Margin before a stall, after this tick |
-| `popularity` | Benefit of one shared copy serving many UEs (broadcast only, scales with group size) |
-| `mobility` | Penalty for a dispersing group (broadcast only) |
-| `switch` | Flat penalty if this mode differs from the current one |
+| First decision for a group | "Started on {mode} — first decision for this group." |
+| Current mode still best | "Staying on {mode} — it is still the best option." |
+| Genuine improvement | "Switched to {mode} — it now delivers this content better." |
+| Rescuing stalled playback | "Switched to {mode} — playback was stalling on {previous}." |
+| Buffers too low to risk it | "Staying on {mode} — buffers are too low to risk switching." |
+| Options too close to call | "Staying on {mode} — the two options are too close to call." |
+| Gain too small to bother | "Staying on {mode} — the gain from switching is too small to be worth it." |
+| Switched too recently | "Staying on {mode} — it switched too recently to change again." |
+| Blocked by network policy | "Staying on {mode} — network policy blocked the change: {plain-English rule}." |
+
+A decision panel showing `selected_mode`, `confidence` and `explanation` is the whole story a viewer needs. An unrecognised reason code degrades to a readable fallback sentence rather than erroring.
 
 ### 3.5 Radio Conditions
 
@@ -285,6 +275,7 @@ Inside the simulator these objects are transient (cleared by `AIAgent.observe()`
 | `mbos_bearer` | The physical bearer actually used: `"cellular"` or `"broadcast"` | string | `DecisionRecord.mbos_bearer` | per-group, per-tick | Backend |
 | `pcf_result` | `"compliant"`, or `"reverted:<rule_name>[,<rule_name>...]"` when PCF overrode the mode | string | `DecisionRecord.pcf_result` | per-group, per-tick | Backend |
 | `inference_latency_ms` | How long this one group's prediction took | ms | `DecisionRecord.inference_latency_ms` | per-group, per-tick | Backend |
+| `explanation` | The same plain sentence as 3.4 — what happened and why | string | `traffic_sim/api/explain.py :: explain_record()`, added by the API when serializing the row | per-group, per-tick | Backend |
 
 Switch timeline (a sequence like `U → U → B → B → U`), per group or per cell: build it by plotting consecutive `decision_history()` rows' `selected_mode` in `tick` order — no new computation on the frontend, just charting backend-provided values in sequence.
 
@@ -329,6 +320,8 @@ The API never re-implements simulation logic. It builds simulators through the e
 | `POST /api/simulations` | Start a run |
 | `GET /api/simulations` | List all runs held by the server |
 | `GET /api/simulations/{id}/status` | Progress and lifecycle state |
+| `POST /api/simulations/{id}/pause` | Freeze a run between ticks |
+| `POST /api/simulations/{id}/resume` | Continue a paused run |
 | `POST /api/simulations/{id}/stop` | Halt a run early |
 | `DELETE /api/simulations/{id}` | Discard a run |
 | `GET /api/simulations/{id}/kpis/latest` | Newest `KPIRecord` |
@@ -381,7 +374,14 @@ List of every run the server currently holds, each in the `/status` shape.
   "tick_interval_s": 0.1, "seed": 11, "error": null
 }
 ```
-`status` ∈ `pending | running | completed | stopped | failed`. On `failed`, `error` carries the exception text.
+`status` ∈ `pending | running | paused | completed | stopped | failed`. On `failed`, `error` carries the exception text.
+
+### `POST /api/simulations/{id}/pause` · `.../resume` (added beyond the original spec)
+Freeze a live run between ticks and continue it later — the core interaction for a dashboard you can actually inspect: pause on an interesting decision, read it, resume. Both return the `/status` payload.
+
+An open **WebSocket stays connected across a pause** (`paused` is not a terminal status); it simply stops receiving ticks until you resume. A paused run can still be stopped or deleted.
+
+Returns **409** if the transition doesn't apply (resuming a run that isn't paused, pausing one that isn't running), so the frontend can drive the buttons off `status` and treat a 409 as "someone else already changed it".
 
 ### `POST /api/simulations/{id}/stop` · `DELETE /api/simulations/{id}` (added beyond the original spec)
 Halt a run early (returns the final `/status` payload, `status: "stopped"`), or discard it entirely (`{"simulation_id": ..., "deleted": true}`).
@@ -416,30 +416,25 @@ Paginated list of current `UE` states (Part 3.2); `cell_id` narrows to one cell 
 Per-group `DeliveryResult`s for the most recent tick (Part 3.3) — the per-group unicast/broadcast breakdown behind the aggregate `mode_breakdown` string. Current tick only.
 
 ### `GET /api/simulations/{id}/decisions/latest`
-This tick's full-detail `AIDecision` objects (Part 3.4), nested `reason` included — the explainability panel's data source. **Only populated when `mode_selector == "ai"`**; `[]` for fixed-rule policies, which make no explainable decision. Current tick only (see 3.4); for decisions across ticks use `/decisions/history` below.
+This tick's AI decisions in the simplified dashboard shape (Part 3.4) — final mode, confidence, and one plain sentence. **Only populated when `mode_selector == "ai"`**; `[]` for fixed-rule policies, which make no explainable decision. Current tick only; for decisions across ticks use `/decisions/history` below.
+
+The internal reasoning chain (utility terms, predicted rates, MBOS/PCF internals) is intentionally **not** in this payload — see 3.4.
 ```json
 [
   {
-    "mode": "broadcast", "confidence": 0.83,
-    "cell_id": "cell_0", "segment_id": "seg_2", "previous_mode": "unicast",
-    "reason": {
-      "candidate": "broadcast", "utility_gap": 0.21, "broadcast_benefit": 0.21,
-      "winning_terms": {"quality": 1.0, "resource": 0.9, "buffer": 0.8, "popularity": 0.75, "mobility": 0.0, "switch": 0.0},
-      "prediction_source": "xgboost", "coordination": "cell_admission", "action": "switch",
-      "mbos": {"session_id": "cell_0:seg_2", "target_bearer": "broadcast", "handover": true, "corrected": false},
-      "pcf": {"compliant": true, "violated_rules": []}
-    },
-    "utility_unicast": 0.31, "utility_broadcast": 0.52,
-    "predicted_unicast_mbps": 1.2, "predicted_broadcast_mbps": 2.4,
-    "prediction_source": "xgboost", "inference_latency_ms": 0.68, "switched": true,
-    "session_id": "cell_0:seg_2", "target_bearer": "broadcast", "handover": true,
-    "pcf_compliant": true, "pcf_violated_rules": []
+    "cell_id": "cell_0", "group_id": "seg_2",
+    "selected_mode": "broadcast", "previous_mode": "unicast", "switched": true,
+    "confidence": 0.88,
+    "explanation": "Switched to broadcast — it now delivers this content better.",
+    "bearer": "broadcast", "policy_compliant": true
   }
 ]
 ```
 
 ### `GET /api/simulations/{id}/decisions/history?limit=`
 The persisted per-group decision history (Part 3.7) — `AIAgent.decision_history(limit)`, already bounded server-side to `config.decision_history_size` rows; `limit` trims further for a smaller payload. `selected_mode` is always the final, post-MBOS-post-PCF mode. **Only meaningful when `mode_selector == "ai"`**; empty list for fixed-rule policies (they never populate this history — see 3.7).
+
+Each row carries **`explanation`**, the same plain sentence as `/decisions/latest` (Part 3.4), so a history table is readable without decoding `decision_reason` codes on the frontend. For a switching-history view, `tick` + `selected_mode` + `explanation` is all you need; the utility numbers are there for optional charting, not headline display.
 ```json
 [
   {
@@ -447,7 +442,8 @@ The persisted per-group decision history (Part 3.7) — `AIAgent.decision_histor
     "previous_mode": "unicast", "selected_mode": "unicast",
     "utility_unicast": 0.547, "utility_broadcast": 0.731, "broadcast_benefit": 0.183,
     "confidence": 0.734, "decision_reason": "hold_cooldown",
-    "mbos_bearer": "cellular", "pcf_result": "compliant", "inference_latency_ms": 0.80
+    "mbos_bearer": "cellular", "pcf_result": "compliant", "inference_latency_ms": 0.80,
+    "explanation": "Staying on unicast — it switched too recently to change again."
   }
 ]
 ```
@@ -478,12 +474,20 @@ Runs `run_comparison()` (Part 3.8) and returns the per-policy rows.
   "simulation_id": "sim_abc123",
   "tick": 42,
   "kpi": { "tick": 42, "sim_time_s": 42.0, "mode_breakdown": "broadcast=13,unicast=4", "...": "...(all KPIRecord fields)" },
-  "decisions": [ { "mode": "broadcast", "reason": { "...": "..." }, "...": "..." } ],
-  "groups":    [ { "mode": "broadcast", "n_requesting": 12, "...": "..." } ]
+  "cells": [ { "cell_id": "cell_0", "congestion": 0.31, "current_load_mbps": 31.0, "num_connected_ues": 34, "...": "..." } ],
+  "decisions": [
+    { "cell_id": "cell_0", "group_id": "seg_2", "selected_mode": "broadcast",
+      "previous_mode": "unicast", "switched": true, "confidence": 0.88,
+      "explanation": "Switched to broadcast — it now delivers this content better.",
+      "bearer": "broadcast", "policy_compliant": true }
+  ],
+  "groups": [ { "mode": "broadcast", "n_requesting": 12, "...": "..." } ]
 }
 ```
 
-One message carries everything the live view needs — the tick's KPIs (Sections 1, 3, 5, 6, 7), its AI decisions with full `reason` detail (Section 4), and its per-group delivery breakdown (Section 3) — so a live dashboard needs **no REST polling at all** while a run is in flight.
+One message carries everything the live view needs — the tick's KPIs (Sections 1, 3, 5, 6, 7), live per-cell load and congestion (Section 2), the AI decisions in their simplified form (Section 4), and the per-group delivery breakdown (Section 3) — so a live dashboard needs **no REST polling at all** while a run is in flight.
+
+**UEs are the one exception** and stay on REST (`/ues`): ~100 objects per tick is real bandwidth for state that changes slowly. Poll them every second or so for the UE map; everything else arrives on the socket.
 
 Behaviour worth knowing:
 - On connect, the **current tick is replayed immediately**, so a client joining mid-run renders at once instead of waiting for the next tick.
@@ -491,6 +495,7 @@ Behaviour worth knowing:
 - When the run finishes the server sends a final `{"type": "status", ...}` message (the `/status` payload, e.g. `"status": "completed"`) and closes.
 - An unknown `simulation_id` yields `{"type": "error", "detail": "..."}` then a close.
 - `decisions` is `[]` for fixed-rule policies — the stream shape is identical across policies, so the same client code handles baselines and the AI.
+- **A pause does not close the socket.** Ticks simply stop arriving until `/resume`, so the dashboard keeps its live view intact across a pause.
 
 Example:
 ```js
@@ -517,12 +522,12 @@ These are recommendations, not specifications — Manus should feel free to adap
 **Cards/charts that matter most:**
 - A **single headline row** of 3–4 big stat tiles: service continuity, resource savings vs. always-unicast, mean QoE, current mode split (unicast % / broadcast %). This is what a judge or reviewer looks at in the first three seconds.
 - A **live switch timeline** (Section 7): a horizontal strip per active group (or an aggregated stacked-area chart of unicast vs. broadcast group counts over time) — this is the single best visual proof that the system is *dynamically adapting*, not applying a fixed rule. Mark handovers distinctly.
-- An **AI decision explainability panel** (Section 4): when a user clicks a group/segment, show its `winning_terms` as a small horizontal bar breakdown (quality/resource/buffer/popularity/mobility/switch) plus the plain-English `action` string and, when relevant, the PCF `violated_rules` — this is what makes the AI's reasoning inspectable rather than a black box.
+- An **AI decision panel** (Section 4): when a user clicks a group/segment, show three things and stop there — the `selected_mode` (the mode actually delivered, after MBOS and PCF), the `confidence` as a simple meter or percentage, and the `explanation` sentence. That is the whole panel. Resist adding the utility-term breakdown or the predicted rates: the API no longer exposes them precisely because a decision panel that reads like a debugger is worse, not better, for the person looking at it. `policy_compliant: false` deserves a small badge ("policy override"), since that is the one case where the network, not the AI, had the last word.
 - An **AI vs. baseline comparison table/chart** (Section 8): a grouped bar chart, one group per KPI (resource saved, continuity, QoE), one bar per policy — this is the project's actual thesis made visible: the AI should sit closer to `always-broadcast`'s resource savings while staying much closer to `always-unicast`'s continuity than `always-broadcast` does.
 
 **Visualizing cells/UEs.** A simple 2D scatter plot using `x_km`/`y_km` (synthetic coordinates, not a real map — don't imply real geography) is enough: cells as labeled circles sized by capacity or shaded by `congestion`, UEs as small dots colored by `delivery_mode` (two colors, unicast vs. broadcast) and optionally by `qoe_state` (a third visual channel, e.g. dot opacity or a thin ring for `starved`). Avoid trying to render a literal "signal strength heatmap" — the radio model is intentionally simplified (Part 1), and implying more physical realism than exists would be misleading.
 
-**Visualizing AI decisions and switching.** Use one consistent color pair for unicast vs. broadcast everywhere in the dashboard (map view, timeline, comparison chart) — consistency here does more for clarity than any single chart's cleverness. A switch event (`AIDecision.switched`) is worth a brief visual pulse/highlight on whichever group/cell it happened in, so the "adapting live" story is felt, not just read from a table.
+**Visualizing AI decisions and switching.** Use one consistent color pair for unicast vs. broadcast everywhere in the dashboard (map view, timeline, comparison chart) — consistency here does more for clarity than any single chart's cleverness. A switch event (`switched: true`) is worth a brief visual pulse/highlight on whichever group/cell it happened in, so the "adapting live" story is felt, not just read from a table. In the switching-history table, `explanation` is the column that carries the story — lead with it rather than with the raw `decision_reason` code.
 
 **Suggested visual style.** A dark, technical, telecom/NOC-dashboard aesthetic reads as credible for this domain: dark background, a small set of saturated accent colors reserved specifically for state (e.g., one hue for unicast, a contrasting hue for broadcast, a third for alerts/violations), monospace or semi-condensed numerals for KPI tiles, generous whitespace between sections rather than dense borders. Avoid skeuomorphic gauges/dials — flat stat tiles and clean line/area/bar charts fit a technical audience better and hold up under the 8-section density this dashboard needs.
 

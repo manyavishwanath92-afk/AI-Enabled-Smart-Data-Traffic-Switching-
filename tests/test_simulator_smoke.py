@@ -121,3 +121,63 @@ def test_simulation_runs_long_without_nan_or_exceptions():
     for ue in sim.ues:
         assert ue.buffer_seconds >= 0.0
         assert not math.isnan(ue.buffer_seconds)
+
+
+# --- reproducibility --------------------------------------------------------
+
+
+def test_same_seed_produces_identical_results():
+    """The matched-seed premise the whole AI-vs-baseline comparison rests on.
+
+    Two runs of the same seed and scenario must agree exactly — not merely
+    closely.
+    """
+    summaries = []
+    for _ in range(2):
+        cfg = SimConfig.default().with_overrides(random_seed=11)
+        sim = Simulator(cfg, always_unicast, scenario="flash_crowd")
+        sim.run(duration_s=30 * cfg.simulation_timestep_s)
+        summaries.append(sim.kpi_engine.summary())
+
+    assert summaries[0] == summaries[1]
+
+
+def test_same_seed_is_reproducible_across_processes():
+    """Regression guard for a real bug: the flash-crowd cell was drawn from
+    an unordered set, so Python's per-process string-hash randomisation put
+    the crowd on a different cell for the *same* seed in different processes
+    (measured spread in service continuity: ~0.78-0.86).
+
+    This has to run in subprocesses to be meaningful. Within one process the
+    hash seed is fixed, so a set of the same strings always iterates the same
+    way and the bug is invisible — an in-process test passes either way.
+    PYTHONHASHSEED is what varies the ordering, so the check is: same sim
+    seed, different hash seeds, identical results.
+    """
+    import os
+    import subprocess
+    import sys
+
+    script = (
+        "from config.config import SimConfig;"
+        "from traffic_sim.simulation.mode_selectors import always_unicast;"
+        "from traffic_sim.simulation.simulator import Simulator;"
+        "c = SimConfig.default().with_overrides(random_seed=11);"
+        "s = Simulator(c, always_unicast, scenario='flash_crowd');"
+        "s.run(duration_s=20 * c.simulation_timestep_s);"
+        "print('%.12f' % s.kpi_engine.summary()['service_continuity'])"
+    )
+
+    results = set()
+    for hash_seed in ("0", "1", "2"):
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PYTHONHASHSEED": hash_seed},
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        )
+        assert completed.returncode == 0, completed.stderr
+        results.add(completed.stdout.strip())
+
+    assert len(results) == 1, f"same seed gave different results across processes: {results}"

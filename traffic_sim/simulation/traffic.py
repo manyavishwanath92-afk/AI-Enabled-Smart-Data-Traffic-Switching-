@@ -95,7 +95,12 @@ def generate_requests(
     flash_cell_id: str | None = None
     flash_segment_id: str | None = None
     if scenario == "flash_crowd" and ues:
-        flash_cell_id = rng.choice(list({ue.cell_id for ue in ues if ue.cell_id}))
+        # sorted(), not list(): set iteration order for strings varies with
+        # Python's per-process hash seed, which would hand rng.choice a
+        # differently-ordered candidate list each run and put the flash crowd
+        # on a different cell for the *same* seed. Sorting makes the draw
+        # reproducible without changing what is being drawn.
+        flash_cell_id = rng.choice(sorted({ue.cell_id for ue in ues if ue.cell_id}))
         flash_segment_id = rng.choice(segment_ids)
 
     for ue in ues:

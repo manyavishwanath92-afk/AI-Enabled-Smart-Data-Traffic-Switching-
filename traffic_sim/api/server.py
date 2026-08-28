@@ -165,6 +165,30 @@ def create_app() -> FastAPI:
     def simulation_status(simulation_id: str) -> dict[str, Any]:
         return _runner_or_404(simulation_id).status_dict()
 
+    @app.post("/api/simulations/{simulation_id}/pause")
+    def pause_simulation(simulation_id: str) -> dict[str, Any]:
+        """Hold a running simulation between ticks.
+
+        An open WebSocket stays connected across a pause — `paused` is not a
+        terminal status — so the dashboard keeps its live view and simply
+        stops receiving new ticks until resumed.
+        """
+        runner = _runner_or_404(simulation_id)
+        if not runner.pause():
+            raise HTTPException(
+                status_code=409, detail=f"simulation is {runner.status}, not running"
+            )
+        return runner.status_dict()
+
+    @app.post("/api/simulations/{simulation_id}/resume")
+    def resume_simulation(simulation_id: str) -> dict[str, Any]:
+        runner = _runner_or_404(simulation_id)
+        if not runner.resume():
+            raise HTTPException(
+                status_code=409, detail=f"simulation is {runner.status}, not paused"
+            )
+        return runner.status_dict()
+
     @app.post("/api/simulations/{simulation_id}/stop")
     def stop_simulation(simulation_id: str) -> dict[str, Any]:
         runner = _runner_or_404(simulation_id)

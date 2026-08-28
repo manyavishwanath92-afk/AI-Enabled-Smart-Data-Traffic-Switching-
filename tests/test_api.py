@@ -104,6 +104,44 @@ def test_simulations_can_be_listed_stopped_and_deleted(client):
     assert client.get(f"/api/simulations/{simulation_id}/status").status_code == 404
 
 
+def test_simulations_can_be_paused_and_resumed(client):
+    simulation_id = start_run(client, ticks=500, tick_interval_s=0.02)
+
+    paused = client.post(f"/api/simulations/{simulation_id}/pause").json()
+    assert paused["status"] == "paused"
+
+    # A pause must actually stop the clock, not just relabel the run.
+    tick_at_pause = client.get(f"/api/simulations/{simulation_id}/status").json()["current_tick"]
+    time.sleep(0.3)
+    assert client.get(f"/api/simulations/{simulation_id}/status").json()["current_tick"] == tick_at_pause
+
+    assert client.post(f"/api/simulations/{simulation_id}/resume").json()["status"] == "running"
+    time.sleep(0.3)
+    assert client.get(f"/api/simulations/{simulation_id}/status").json()["current_tick"] > tick_at_pause
+
+    client.post(f"/api/simulations/{simulation_id}/stop")
+
+
+def test_pause_and_resume_reject_nonsensical_transitions(client):
+    simulation_id = start_run(client, ticks=500, tick_interval_s=0.02)
+
+    # Not paused yet, so there is nothing to resume.
+    assert client.post(f"/api/simulations/{simulation_id}/resume").status_code == 409
+
+    client.post(f"/api/simulations/{simulation_id}/pause")
+    assert client.post(f"/api/simulations/{simulation_id}/pause").status_code == 409
+
+    client.post(f"/api/simulations/{simulation_id}/stop")
+
+
+def test_a_paused_simulation_can_still_be_stopped(client):
+    """Otherwise a paused run would wait forever and never release."""
+    simulation_id = start_run(client, ticks=500, tick_interval_s=0.02)
+    client.post(f"/api/simulations/{simulation_id}/pause")
+
+    assert client.post(f"/api/simulations/{simulation_id}/stop").json()["status"] == "stopped"
+
+
 def test_unknown_simulation_id_is_a_404(client):
     assert client.get("/api/simulations/sim_nope/status").status_code == 404
     assert client.get("/api/simulations/sim_nope/kpis/latest").status_code == 404
@@ -243,21 +281,57 @@ def test_decision_history_limit_returns_the_most_recent_rows(client):
     assert trimmed == full[-3:]
 
 
-def test_decisions_latest_carries_full_explainability_detail(client):
-    """The `reason` payload is what the dashboard's explainability panel
-    renders — it must survive the round trip intact."""
+def test_decisions_latest_shows_final_mode_confidence_and_a_plain_reason(client):
+    """What the dashboard's explainability panel renders: the final mode,
+    how sure the agent was, and one readable sentence."""
     simulation_id = start_run(client, ticks=5)
     run_to_completion(client, simulation_id)
 
     decisions = client.get(f"/api/simulations/{simulation_id}/decisions/latest").json()
     assert len(decisions) > 0
     for decision in decisions:
-        assert decision["mode"] in ("unicast", "broadcast")
-        assert decision["prediction_source"] in ("xgboost", "analytical")
-        reason = decision["reason"]
-        assert set(reason["winning_terms"])  # utility breakdown really present
-        assert "target_bearer" in reason["mbos"]
-        assert "compliant" in reason["pcf"]
+        # The FINAL mode, after MBOS coordination and PCF enforcement.
+        assert decision["selected_mode"] in ("unicast", "broadcast")
+        assert decision["bearer"] in ("cellular", "broadcast")
+        assert 0.0 <= decision["confidence"] <= 1.0
+        assert decision["explanation"].endswith(".")
+        assert decision["selected_mode"] in decision["explanation"]
+        assert isinstance(decision["switched"], bool)
+
+
+def test_decisions_latest_does_not_leak_the_internal_reasoning_chain(client):
+    """The prediction -> utility -> agent internals stay in the backend; the
+    dashboard is meant to show a conclusion, not the whole derivation."""
+    simulation_id = start_run(client, ticks=5)
+    run_to_completion(client, simulation_id)
+
+    decisions = client.get(f"/api/simulations/{simulation_id}/decisions/latest").json()
+    assert len(decisions) > 0
+    internal = {
+        "reason",
+        "winning_terms",
+        "utility_unicast",
+        "utility_broadcast",
+        "predicted_unicast_mbps",
+        "predicted_broadcast_mbps",
+        "prediction_source",
+    }
+    for decision in decisions:
+        assert internal.isdisjoint(decision), f"leaked internals: {internal & set(decision)}"
+
+
+def test_decision_history_rows_carry_a_readable_explanation(client):
+    simulation_id = start_run(client, ticks=8)
+    run_to_completion(client, simulation_id)
+
+    history = client.get(f"/api/simulations/{simulation_id}/decisions/history").json()
+    assert len(history) > 0
+    for row in history:
+        assert row["explanation"]
+        # The sentence must describe the mode that was actually delivered.
+        assert row["selected_mode"] in row["explanation"]
+        # ...and never restate the raw internal code.
+        assert row["decision_reason"] not in row["explanation"]
 
 
 def test_baseline_selectors_expose_no_ai_decisions(client):
@@ -306,12 +380,35 @@ def test_websocket_streams_one_message_per_tick_then_a_final_status(client):
                 assert message["kpi"]["tick"] == message["tick"]
                 assert isinstance(message["decisions"], list)
                 assert isinstance(message["groups"], list)
+                # Cells ride along so the live network view needs no polling.
+                assert len(message["cells"]) == SimConfig.default().num_cells
+                assert all("congestion" in c for c in message["cells"])
             else:
                 assert message["type"] == "status"
                 assert message["status"] == "completed"
                 break
 
     assert ticks == [1, 2, 3, 4, 5]  # every tick delivered, in order, none dropped
+
+
+def test_websocket_decisions_carry_the_final_mode_and_an_explanation(client):
+    """The dashboard reads decisions off the stream, so the same guarantee
+    the REST endpoint gives must hold there too."""
+    simulation_id = start_run(client, ticks=4, tick_interval_s=0.05)
+
+    seen = 0
+    with client.websocket_connect(f"/api/simulations/{simulation_id}/live") as ws:
+        while True:
+            message = ws.receive_json()
+            if message["type"] != "tick":
+                break
+            for decision in message["decisions"]:
+                assert decision["selected_mode"] in ("unicast", "broadcast")
+                assert decision["explanation"]
+                assert "reason" not in decision
+                seen += 1
+
+    assert seen > 0
 
 
 def test_websocket_rejects_an_unknown_simulation(client):
@@ -341,3 +438,64 @@ def test_api_run_matches_a_direct_simulator_run_exactly(client):
         if key in WALL_CLOCK_KPIS:
             continue
         assert api_summary[key] == pytest.approx(expected, abs=1e-12), key
+
+
+# --- explanation rendering --------------------------------------------------
+
+
+def test_every_agent_reason_code_renders_a_readable_sentence():
+    """Each code the agent can emit must have a sentence — a missing one
+    would surface as raw jargon in the dashboard."""
+    from traffic_sim.api.explain import explain_decision
+
+    codes = [
+        "initial_assignment",
+        "hold_already_optimal",
+        "switch",
+        "switch_escape_stall",
+        "hold_buffer_unsafe",
+        "hold_low_confidence",
+        "hold_within_hysteresis",
+        "hold_cooldown",
+        "hold_pcf_policy_violation",
+    ]
+    for code in codes:
+        sentence = explain_decision(code, "broadcast", previous_mode="unicast")
+        assert sentence.endswith(".")
+        assert "broadcast" in sentence
+        assert code not in sentence, f"{code} leaked its raw code into the text"
+
+
+def test_pcf_violations_name_the_reason_in_plain_words():
+    from traffic_sim.api.explain import explain_decision
+
+    sentence = explain_decision(
+        "hold_pcf_policy_violation", "unicast", "broadcast", ["priority_buffer_margin"]
+    )
+    assert "buffered playback" in sentence
+    assert "priority_buffer_margin" not in sentence
+
+
+def test_an_unknown_reason_code_degrades_instead_of_raising():
+    """A serving layer must not 500 because the agent gained a new code."""
+    from traffic_sim.api.explain import explain_decision
+
+    sentence = explain_decision("some_future_code", "unicast")
+    assert "unicast" in sentence
+    assert sentence.endswith(".")
+
+
+def test_history_rows_unpack_pcf_rules_from_their_stored_form():
+    """History stores PCF's verdict as 'reverted:<rule>', not a rule list."""
+    from traffic_sim.api.explain import explain_record
+
+    sentence = explain_record(
+        {
+            "decision_reason": "hold_pcf_policy_violation",
+            "selected_mode": "unicast",
+            "previous_mode": "broadcast",
+            "pcf_result": "reverted:confidence_floor",
+        }
+    )
+    assert "confident enough" in sentence
+    assert "confidence_floor" not in sentence

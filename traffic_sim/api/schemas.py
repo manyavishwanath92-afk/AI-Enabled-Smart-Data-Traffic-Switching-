@@ -12,6 +12,7 @@ from dataclasses import asdict
 from enum import Enum
 from typing import Any
 
+from traffic_sim.api.explain import explain_decision, explain_record
 from traffic_sim.delivery.result import DeliveryResult
 from traffic_sim.simulation.cell import Cell
 from traffic_sim.simulation.user import UE
@@ -67,37 +68,49 @@ def ue_to_dict(ue: UE) -> dict[str, Any]:
 
 
 def decision_to_dict(decision: Any) -> dict[str, Any]:
-    """One full-detail `AIDecision`, including its nested `reason` dict.
+    """One `AIDecision`, reduced to what a dashboard should show.
 
-    `reason` is already plain (strings, floats, and the dicts MBOS/PCF/utility
-    each build in their own `explain()`), so it passes through untouched — that
-    nested detail is what the dashboard's explainability panel renders.
+    Deliberately NOT the full record. The agent's internal chain — the
+    per-term utility breakdown, the raw utility scores, the predicted rates,
+    which predictor ran, MBOS/PCF internals — stays inside the backend, where
+    it is still computed and still tested. What comes out here is the part a
+    viewer can act on: the final mode, how sure the agent was, and one plain
+    sentence saying why.
+
+    `mode` is `AIDecision.mode`, i.e. the mode after MBOS coordination and
+    PCF enforcement — never the agent's pre-policy candidate. Field names
+    match `DecisionRecord` so the live and historical views line up.
     """
+    selected_mode = _enum_value(decision.mode)
+    previous_mode = _enum_value(decision.previous_mode)
     return {
-        "mode": _enum_value(decision.mode),
         "cell_id": decision.cell_id,
-        "segment_id": decision.segment_id,
-        "previous_mode": _enum_value(decision.previous_mode),
-        "confidence": decision.confidence,
-        "reason": decision.reason,
-        "utility_unicast": decision.utility_unicast,
-        "utility_broadcast": decision.utility_broadcast,
-        "predicted_unicast_mbps": decision.predicted_unicast_mbps,
-        "predicted_broadcast_mbps": decision.predicted_broadcast_mbps,
-        "prediction_source": decision.prediction_source,
-        "inference_latency_ms": decision.inference_latency_ms,
+        "group_id": decision.segment_id,
+        "selected_mode": selected_mode,
+        "previous_mode": previous_mode,
         "switched": decision.switched,
-        "session_id": decision.session_id,
-        "target_bearer": decision.target_bearer,
-        "handover": decision.handover,
-        "pcf_compliant": decision.pcf_compliant,
-        "pcf_violated_rules": list(decision.pcf_violated_rules),
+        "confidence": decision.confidence,
+        "explanation": explain_decision(
+            action=str(decision.reason.get("action", "")),
+            selected_mode=selected_mode,
+            previous_mode=previous_mode,
+            violated_rules=list(decision.pcf_violated_rules),
+        ),
+        "bearer": decision.target_bearer,
+        "policy_compliant": decision.pcf_compliant,
     }
 
 
 def decision_record_to_dict(record: Any) -> dict[str, Any]:
-    """One persisted `DecisionRecord` — already flat and JSON-ready."""
-    return asdict(record)
+    """One persisted `DecisionRecord`, plus its rendered explanation.
+
+    Every stored field is kept as-is (the history contract predates this and
+    charts may use the numbers); `explanation` is added so a history table can
+    be read without decoding `decision_reason` codes on the frontend.
+    """
+    payload = asdict(record)
+    payload["explanation"] = explain_record(payload)
+    return payload
 
 
 def delivery_result_to_dict(result: DeliveryResult) -> dict[str, Any]:
