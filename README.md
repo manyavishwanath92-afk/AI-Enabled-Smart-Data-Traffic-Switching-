@@ -232,5 +232,8 @@ This is a research proof of concept, and the boundaries are deliberate:
 
 ## License
 
-No license has been chosen yet — all rights reserved until one is added. Add a `LICENSE` file
-before inviting outside contributions.
+**All rights reserved.** See [`LICENSE`](LICENSE).
+
+This repository is public so it can be read and evaluated. It is **not** open source: no
+permission is granted to use, copy, modify, or distribute the code. If you would like to use
+any part of it, please get in touch first.
