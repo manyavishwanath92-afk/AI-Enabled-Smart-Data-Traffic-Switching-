@@ -1,8 +1,8 @@
 """The dashboard API serving real simulator output.
 
 These tests exercise the HTTP/WebSocket layer against genuinely running
-simulations — nothing is stubbed, so a passing suite means the endpoints Manus
-will call return real data in the documented shape.
+simulations — nothing is stubbed, so a passing suite means the endpoints the
+dashboard calls return real data in the documented shape.
 """
 
 import time

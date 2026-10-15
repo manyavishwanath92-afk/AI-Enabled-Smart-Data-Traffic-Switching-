@@ -1,230 +1,236 @@
 # AI-Enabled Smart Data Traffic Switching
 
-A software simulation / proof-of-concept of an AI-native telecom network that
-dynamically switches content delivery between **unicast** and **broadcast**
-at the content-segment level. This is a closed-loop simulation, not a real
-5G core, RAN, or broadcast transmitter — see `docs/assumptions.md` style
-caveats inline in each module's docstring.
+An end-to-end simulation of an AI-driven telecom network that decides, for every content
+request, whether to deliver it over **cellular unicast** or a **shared broadcast carrier** —
+and adapts that decision continuously as network conditions change.
 
-## Project phases
+Built from scratch in Python, with a trained XGBoost decision layer, a FastAPI service, and a
+live React dashboard.
 
-This repository is built incrementally, per the project build guide:
+---
 
-- **Phase 1 (done)** — foundational network simulator: cells, UEs,
-  mobility, synthetic content/subscriptions, radio math (path loss →
-  received power → SINR → Shannon capacity), unicast/broadcast delivery,
-  buffer dynamics, and a KPI engine. Delivery-mode selection is a
-  pluggable, non-AI `mode_selector` (fixed rules only).
-- **Phase 2a (this phase)** — make the radio model actually drive
-  delivery: a calibrated interference model, an achievable-rate layer
-  linking Shannon capacity to the buffer, coherent segment bitrates, and
-  playback-continuity KPIs. Still **no AI/ML, no utility model, no AI
-  agent, no MBOS/PCF logic, and no dashboard.**
-- **Phase 2b/3 (this phase)** — the intelligence layer: features →
-  XGBoost outcome prediction → utility → AI agent → delivery →
-  closed-loop feedback, plus a matched comparison harness. Lives in
-  `traffic_sim/ai/` and `traffic_sim/experiments/`.
-- **Later** — MBOS/PCF as first-class modules and a dashboard. Still
-  empty stubs: `traffic_sim/policy/`, `traffic_sim/mbos/`,
-  `traffic_sim/visualization/`.
+## The problem
 
-## The intelligence layer
+When many people in the same area want the same content at the same time — a live match, a
+breaking-news stream — the network sends each of them a private copy. The same bytes go out
+over and over, and capacity runs out long before demand does.
+
+A shared broadcast transmission fixes that: one transmission, any number of listeners, for the
+cost of a single stream. But broadcast is not free and not always better:
+
+- The broadcast carrier is a **fixed-size shared pipe**. A few streams fit comfortably; too
+  many, and every listener gets a thin, unwatchable slice.
+- A broadcast must be sized for the **worst-placed device** in the group, so one user with a
+  weak signal limits everyone.
+- Groups **disperse**. Devices move, change cells, and stop watching.
+
+So the right answer changes from moment to moment and from group to group. A fixed rule like
+"broadcast once more than N users want it" gets this wrong often, because group size is only
+one of the factors that matter.
+
+**This project treats that choice as a prediction problem and learns to make it.**
+
+---
+
+## How it works
+
+The simulator advances in discrete ticks. Every tick, devices move, request content, and are
+grouped by *(cell, content segment)*. Each group then flows through this pipeline:
 
 ```
-network state → features → XGBoost (predicts each mode's outcome)
-    → utility (scores the trade-off) → agent (applies policy & safety)
-    → UNICAST / BROADCAST → simulator → changed state → feedback
+  live network state
+         │
+         ▼
+  feature extraction ─────────── demand, buffer levels, signal quality,
+         │                       mobility risk, capacity, prior congestion
+         ▼
+  XGBoost prediction ─────────── one model per delivery mode, each predicting
+         │                       the delivery rate that mode would achieve
+         ▼
+  utility scoring ────────────── named, weighted terms turn each predicted
+         │                       outcome into one comparable score
+         ▼
+  cell-level admission ───────── rank every candidate group by how much it
+         │                       would gain from broadcast, then fill the
+         │                       shared carrier highest-gain-first
+         ▼
+  safety gates ───────────────── buffer margin, confidence floor,
+         │                       hysteresis, cooldown, stall escape
+         ▼
+  MBOS coordination ──────────── assign a session and a physical bearer,
+         │                       flag handovers
+         ▼
+  policy enforcement (PCF) ───── independently re-validate the decision;
+         │                       may revert it
+         ▼
+  delivery ───────────────────── the chosen mode actually transmits
+         │
+         ▼
+  measurement ────────────────── per-tick KPIs
+         │
+         └──────── feedback into the next tick's features ──────────┐
+                                                                    │
+         ◄──────────────────────────────────────────────────────────┘
 ```
 
-The three steps are deliberately separate and individually inspectable:
+### The physics pushes back
 
-| Step | File | Answers |
-|---|---|---|
-| Features | `ai/feature_engineering.py` | what do we know right now? |
-| Prediction | `ai/predict.py`, `ai/train.py` | what will each mode do? |
-| Utility | `ai/utility.py` | which outcome do we prefer, and why? |
-| Agent | `ai/agent.py` | what are we allowed to do about it? |
+Delivery is not scripted to favour either mode. Content moves through a full radio chain:
 
-**Why ML when the simulator could just compute the answer?** A real
-network cannot try both modes and keep the better one. The simulator can,
-so it manufactures ground truth *at training time only*
-(`ai/dataset.py`). At decision time the agent sees telemetry alone. If
-the model is missing the agent falls back to computing outcomes
-analytically and says so via `PredictionResult.source`, so results are
-never mislabelled as model-driven.
-
-XGBoost is the only ML model used. Two regressors (one per mode) predict
-achievable delivery rate; R² ≈ 0.999, MAE ≈ 0.01 Mbps.
-
-```bash
-python -m traffic_sim.ai.train                      # retrain (models are committed)
-python -m traffic_sim.main --mode-selector ai       # run the agent
-python -m traffic_sim.main --compare                # matched policy comparison
+```
+distance → path loss → received power → SINR → Shannon capacity
+        → achievable rate → seconds of content → playback buffer → stall / no stall
 ```
 
-### Measured results
+Unicast devices **share** the cell's capacity, so throughput degrades as a cell fills.
+A broadcast transmission is **not** divided by group size — that is the physical reason it wins
+under a crowd — but it **is** divided among concurrent broadcast streams, which is what stops
+"broadcast everything" from being trivially correct.
 
-Matched seeds, flash-crowd, 60 ticks. **Default carrier (60 Mbps)** —
-broadcast is genuinely the right answer, and the AI finds it:
+Because every group's mode is decided *before* any delivery happens, moving a group to
+broadcast genuinely frees cellular capacity for the devices that stay on unicast.
 
-| policy | resource saved | continuity | QoE | switches |
-|---|---|---|---|---|
-| always-unicast | 0.000 | 0.678 | 0.186 | 0 |
-| always-broadcast | 0.839 | 1.000 | 0.485 | 0 |
-| rule-by-group-size | 0.289 | 0.795 | 0.250 | 0 |
-| **ai** | 0.758 | **1.000** | **0.497** | 50.7 |
+---
 
-Switch count is higher here than the constrained-carrier case below —
-see the note under "Cell-level coordination" for why: with an abundant
-carrier and scattered background traffic, a cell can have 6-8 concurrent
-broadcast candidates, and which exact set fits shifts slightly as
-individual UEs' radio conditions drift tick to tick. Outcomes (savings,
-continuity, QoE) are barely affected; this is a churn cost that was not
-present before coordination was added and is flagged here rather than
-hidden, in the same spirit as the constrained-carrier tradeoffs below.
+## Design principles
 
-**Constrained carrier (4 Mbps)** — broadcasting everything now destroys
-service, and the AI backs off:
+The decision layer is built to be inspectable rather than opaque.
 
-| policy | resource saved | continuity | QoE | switches |
-|---|---|---|---|---|
-| always-unicast | 0.000 | 0.713 | 0.202 | 0 |
-| always-broadcast | 0.846 | **0.442** | 0.072 | 0 |
-| rule-by-group-size | 0.302 | 0.829 | 0.270 | 0 |
-| **ai** | 0.186 | **0.865** | **0.303** | 37.7 |
+**The model predicts outcomes, not decisions.** Two regressors estimate *what each mode would
+achieve*; a separate utility function decides *which outcome is preferable*. A single
+classifier emitting "unicast" or "broadcast" would have been simpler, and would have buried the
+reasoning inside the model. Keeping the steps apart means every decision decomposes into named
+numbers.
 
-(Same matched seeds and tick count as the default-carrier table above;
-figures are the `--compare` output for `broadcast_cell_capacity_mbps=4.0`.)
+**No privileged information at decision time.** The simulator *can* compute both outcomes
+exactly — a real network cannot. So ground truth is manufactured offline, at training time
+only. At decision time the agent sees nothing a deployed system could not observe.
 
-**Cell-level coordination.** Independently-decided groups produced the
-same herd oscillation described above — every group reacted to the same
-shared-carrier contention reading, so a busy carrier made the whole cell
-leave broadcast at once, which made it look free, which drew them all
-back (98.7 switches/60 ticks). `traffic_sim/ai/cell_controller.py` fixes
-this by deciding once per cell instead of once per group: every
-candidate is ranked by `broadcast_benefit = max(0, U_broadcast −
-U_unicast)`, then admitted to the shared carrier highest-benefit-first,
-only while the carrier can still sustain the bitrate of every group
-already admitted (both its raw `broadcast_capacity_mbps` and each
-group's own worst-case Shannon capacity, divided across everyone
-sharing it). Groups that don't fit stay on unicast.
+**The model does not get the last word.** Deterministic gates can override it when buffers are
+too low, when the options are too close to call, when the gain is too small to justify the
+churn, or when the group switched too recently. A stall-escape path ensures a safety gate can
+never trap a group in a mode that is actively failing. A separate policy layer then
+re-validates the result independently, and can revert it.
 
-This took switching **98.7 → 37.7** (62% fewer) and flipped the
-comparison against the naive rule: before coordination the AI's
-continuity (0.840) trailed the rule's (0.864); afterward the AI's (0.865)
-**beats** it. Diagnosing the remaining churn found the ranking itself was
-unstable at the margin — a group's own utility gap stays large even when
-it's the admission *boundary* that's wobbling, so the existing hysteresis
-gate (which only looks at raw utility gap) never damped it. The fix
-reuses `hysteresis_margin` as a small ranking tie-break favouring
-whichever group already holds a broadcast seat, so a newcomer must be
-genuinely better, not just marginally luckier this tick, to bump it.
+**Provenance is explicit.** If the trained models are unavailable, the system computes outcomes
+analytically instead of failing — and labels which path produced the result, so an output is
+never presented as model-driven when it is not.
 
-Two prior, smaller-scope attempts were tried and rejected because they
-didn't clearly pay off: exponentially smoothing the shared contention
-signal cut churn to 79 but slightly hurt continuity and savings; a
-looser admission check helped less than the ranking fix. Both were
-reverted rather than kept as unproven complexity.
+**Decisions are explained in plain language.** Each decision records a reason code that the API
+renders as a readable sentence, so the dashboard can show the chosen mode, how decisively the
+options separated, and why.
 
-Two known limitations worth stating plainly:
-- Tree models cannot extrapolate. An early version trained at a single
-  broadcast capacity learned to ignore that feature and kept choosing
-  broadcast into a starved carrier. `ai/dataset.py` now sweeps capacity
-  settings; `broadcast_capacity_mbps` became the top broadcast feature
-  (0.563 importance). Retrain if you change the physics.
-- At decision time the agent cannot know how many UEs will end up on
-  unicast this tick, so it assumes the whole cell population — the
-  pessimistic case for unicast.
+---
 
-## Setup
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| `config/` | `SimConfig` — the single source of truth for every tunable parameter |
+| `traffic_sim/simulation/` | Tick loop, cells, devices, mobility, buffers, traffic generation |
+| `traffic_sim/network/` | Radio chain: path loss, received power, SINR, capacity, throughput |
+| `traffic_sim/content/` | Synthetic content catalogue and subscription tracking |
+| `traffic_sim/delivery/` | Unicast and broadcast delivery paths |
+| `traffic_sim/ai/` | Features, training data, XGBoost models, utility, admission control, agent |
+| `traffic_sim/mbos/` | Session and bearer coordination |
+| `traffic_sim/policy/` | Policy enforcement layer |
+| `traffic_sim/kpi/` | Metrics: continuity, QoE, buffer health, resource savings |
+| `traffic_sim/experiments/` | Matched-seed policy comparison harness |
+| `traffic_sim/api/` | FastAPI service and WebSocket tick stream |
+| `frontend/` | React + TypeScript live dashboard |
+| `tests/` | Radio math, delivery, AI layer, policy, and API coverage |
+
+---
+
+## Getting started
+
+Requires Python 3.10+.
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
-pip install pytest
 ```
 
-## Running the simulator
+### Run a simulation
 
 ```bash
-python -m traffic_sim.main --scenario flash_crowd --mode-selector always-broadcast
+# the AI decision layer
+python -m traffic_sim.main --scenario flash_crowd --mode-selector ai
+
+# fixed baselines, for comparison
 python -m traffic_sim.main --scenario flash_crowd --mode-selector always-unicast
+python -m traffic_sim.main --scenario flash_crowd --mode-selector always-broadcast
+python -m traffic_sim.main --scenario flash_crowd --mode-selector rule-by-group-size
 ```
 
-Output is printed as a summary table and exported to `data/generated/`.
+Results print as a summary and export to `data/generated/`.
 
-## Running tests
+### Compare policies on matched seeds
 
 ```bash
+python -m traffic_sim.main --compare
+```
+
+Runs every policy against identical traffic, seeds, and content, so any difference is
+attributable to the policy rather than to luck.
+
+### Retrain the models
+
+Trained models are committed, so the AI path works with no setup step.
+
+```bash
+python -m traffic_sim.ai.train
+```
+
+Retrain if you change the radio or capacity model — tree models cannot extrapolate beyond the
+conditions they were trained on.
+
+### Dashboard
+
+```bash
+pip install -e '.[api]'
+python -m traffic_sim.api          # http://127.0.0.1:8000  (Swagger at /docs)
+```
+
+```bash
+cd frontend
+pnpm install
+pnpm dev                           # http://127.0.0.1:5173
+```
+
+Start a run with a non-zero tick interval to watch decisions arrive live over the WebSocket.
+
+### Tests
+
+```bash
+pip install -e '.[dev]'
 pytest
 ```
 
-## Key simplifying assumptions (Phase 1)
+---
 
-- Radio equations (path loss, interference, SINR, Shannon capacity) are
-  deliberately simplified PoC assumptions, not a 3GPP/ATSC PHY-layer
-  implementation. See `traffic_sim/network/` module docstrings.
-- Content is synthetic metadata only; no real video/segmentation.
-- Coordinates are a synthetic 2D Cartesian plane (km), not real geography.
-- Multicast is out of scope entirely (deferred indefinitely per the source
-  use case). Deep-learning mobility prediction, reinforcement learning, and
-  real operator-network integration are also out of scope.
-## Interference model
+## Scope and limitations
 
-Interference uses a calibrated **noise-rise** (interference-over-thermal)
-model, in `config/config.py` / `traffic_sim/network/sinr.py`:
+This is a research proof of concept, and the boundaries are deliberate:
 
-```
-I_linear = interference_rise_coeff * active_users * noise_linear
-```
+- **The radio model is simplified.** Path loss, interference, SINR, and Shannon capacity are
+  internally consistent and genuinely constrain delivery, but they are not a 3GPP or ATSC
+  physical-layer implementation. ATSC 3.0 is the conceptual reference for the broadcast path;
+  no broadcast hardware or protocol is involved.
+- **Content is synthetic metadata.** No real video is encoded, segmented, or transmitted.
+- **Coordinates are a synthetic 2D plane**, not real geography.
+- **Multicast is out of scope**, as are deep-learning mobility prediction and reinforcement
+  learning. XGBoost is the only model used.
+- **At decision time the agent cannot know** how many devices will end up on unicast this tick,
+  so it assumes the full cell population — the pessimistic case for unicast.
+- **KPI instrumentation is being refined.** Some reported metrics are still being reworked to
+  measure exactly what their names claim, so current dashboard figures are directional rather
+  than final.
 
-Interference is expressed *relative to the noise floor* rather than as
-an absolute milliwatt figure, which keeps it dimensionally consistent
-with the signal and noise terms it is summed against. At the defaults
-this yields SINR spanning roughly 5–41 dB, falling with both distance
-and cell load.
+---
 
-An earlier formula inherited from an older PoC,
-`I_linear = coeff * active_users` (no noise term), was dimensionally
-unsound: it produced a bare milliwatt figure, while a received signal at
-these Tx/path-loss defaults is ~6e-9 mW. At 30 active users that
-interference term was 0.6 mW — roughly eight orders of magnitude above
-the signal — so SINR collapsed to ~1e-9 regardless of distance or load,
-Shannon capacity collapsed to ~0, and the delivery chain could not move
-any content at all. It has been removed rather than kept as a selectable
-option: this simulator implements one interference model.
+## License
 
-## Service continuity
-
-Service continuity has exactly one definition, computed from actual
-playback stalls in `traffic_sim/kpi/reliability.py`:
-
-```
-SC = 1 - (total playback interruption time / total playback time)
-```
-
-SINR does **not** define continuity directly. It reaches
-continuity only through the delivery chain — SINR sets Shannon capacity,
-which sets the achievable delivery rate, which is raced against the
-segment's bitrate to fill or drain the UE buffer; an empty buffer is a
-stall, and stalls are what SC counts. Raw radio quality is reported
-separately as the `mean_sinr_db` KPI.
-
-**The radio chain now gates delivery.** In Phase 1 SINR and Shannon
-capacity were computed, reported, and then discarded; throughput was
-decided purely by resource accounting. The full chain is now closed:
-
-```
-distance → path loss → received power → SINR → Shannon capacity
-        → achievable delivery rate → content received → buffer → playback continuity
-```
-
-Unicast UEs share both the radio-limited and resource-limited capacity
-with the other UEs their cell is serving by unicast, so throughput
-degrades as a cell fills. A broadcast transmission is sized at the
-group's worst-case SINR and is *not* divided by group size, which is the
-physical reason it wins under a flash crowd. Because delivery modes are
-decided for all groups before any are delivered, offloading a group to
-broadcast genuinely frees cellular capacity for the UEs that remain on
-unicast.
+No license has been chosen yet — all rights reserved until one is added. Add a `LICENSE` file
+before inviting outside contributions.

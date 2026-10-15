@@ -1,8 +1,8 @@
 # Frontend / API Handoff — AI-Enabled Smart Data Traffic Switching
 
-**Audience:** Manus (frontend/dashboard implementer).
+**Audience:** the frontend/dashboard implementer.
 
-**Status: the API in Part 4 is implemented and ready to connect to.** Start it with `pip install -e '.[api]'` then `python -m traffic_sim.api`, and browse the live Swagger docs at `http://127.0.0.1:8000/docs`. It serves real data from real simulation runs — nothing is mocked. The WebSocket in Part 5 is implemented too. No frontend code exists yet; that is Manus's job, and Parts 3 and 6 are written to support it.
+**Status: the API in Part 4 is implemented and ready to connect to.** Start it with `pip install -e '.[api]'` then `python -m traffic_sim.api`, and browse the live Swagger docs at `http://127.0.0.1:8000/docs`. It serves real data from real simulation runs — nothing is mocked. The WebSocket in Part 5 is implemented too. The dashboard in `frontend/` consumes this contract; Parts 3 and 6 record the field-by-field sourcing and the design rationale behind it.
 
 Every field named below is cited to a real file/function/class in the repository. Nothing here is invented. Where a value is only available for the current tick rather than historically, that is stated plainly rather than glossed over.
 
@@ -513,9 +513,9 @@ ws.onmessage = (e) => {
 
 ---
 
-## Part 6 — Design Recommendations for Manus
+## Part 6 — Dashboard Design Recommendations
 
-These are recommendations, not specifications — Manus should feel free to adapt them to good UI judgment. No backend changes are implied by anything in this section.
+These are recommendations, not specifications — adapt them to good UI judgment. No backend changes are implied by anything in this section.
 
 **Overall layout.** A left-hand or top persistent bar for run controls (scenario, mode-selector, start/stop, current tick) and global KPIs (service continuity, resource savings, QoE — the three numbers a reviewer should be able to read in one glance). The main area tabs or scrolls through the 8 sections in the order they were defined in Part 3 — that order already reads as a story: overview → what the network looks like → what mode is being used → why the AI chose it → why the radio made that possible → what the user actually experienced → how it changed over time → how it compares to not having an AI at all.
 
